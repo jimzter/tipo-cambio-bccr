@@ -1,0 +1,141 @@
+name: Actualizar tipo de cambio
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9,12,15 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v5
+
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Consultar BCCR y generar JSON
+        env:
+          BCCR_TOKEN: ${{ secrets.BCCR_TOKEN }}
+          BCCR_NOMBRE: jimmy
+          BCCR_CORREO: jtellezsandoval@gmail.com
+        run: |
+          python - << 'PY'
+          import json
+          import os
+          import re
+          import html
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from urllib.parse import urlencode
+          from urllib.request import urlopen
+          from urllib.error import HTTPError, URLError
+
+          token = os.environ["BCCR_TOKEN"]
+          nombre = os.environ["BCCR_NOMBRE"]
+          correo = os.environ["BCCR_CORREO"]
+
+          zona_cr = ZoneInfo("America/Costa_Rica")
+          ahora_cr = datetime.now(zona_cr)
+          actualizado = ahora_cr.strftime("%d/%m/%Y %H:%M:%S")
+
+          def consultar(indicador, fecha_texto):
+              params = {
+                  "Indicador": indicador,
+                  "FechaInicio": fecha_texto,
+                  "FechaFinal": fecha_texto,
+                  "Nombre": nombre,
+                  "SubNiveles": "N",
+                  "CorreoElectronico": correo,
+                  "Token": token
+              }
+
+              url = (
+                  "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
+                  "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML?"
+                  + urlencode(params)
+              )
+
+              try:
+                  with urlopen(url, timeout=60) as response:
+                      raw = response.read().decode("utf-8", errors="ignore")
+              except HTTPError as e:
+                  print(f"HTTPError {e.code} para indicador {indicador} en fecha {fecha_texto}")
+                  return None
+              except URLError as e:
+                  print(f"URLError para indicador {indicador} en fecha {fecha_texto}: {e}")
+                  return None
+              except Exception as e:
+                  print(f"Error inesperado para indicador {indicador} en fecha {fecha_texto}: {e}")
+                  return None
+
+              data = html.unescape(raw)
+              m_valor = re.search(r"<NUM_VALOR>(.*?)</NUM_VALOR>", data, re.S)
+
+              if not m_valor:
+                  print(f"No se encontró NUM_VALOR para indicador {indicador} en fecha {fecha_texto}")
+                  return None
+
+              try:
+                  return float(m_valor.group(1).strip())
+              except Exception:
+                  return None
+
+          fecha_encontrada = None
+          compra = None
+          venta = None
+
+          for i in range(0, 8):
+              fecha_prueba = ahora_cr - timedelta(days=i)
+              fecha_texto = fecha_prueba.strftime("%d/%m/%Y")
+
+              compra_temp = consultar("317", fecha_texto)
+              venta_temp = consultar("318", fecha_texto)
+
+              if compra_temp is not None and venta_temp is not None:
+                  fecha_encontrada = fecha_texto
+                  compra = compra_temp
+                  venta = venta_temp
+                  break
+
+          if compra is None or venta is None:
+              print("No se encontró un valor nuevo; se conserva el JSON actual.")
+              if os.path.exists("tipocambio.json"):
+                  with open("tipocambio.json", "r", encoding="utf-8") as f:
+                      salida = json.load(f)
+                  salida["actualizado"] = actualizado
+              else:
+                  salida = {
+                      "compra": 0,
+                      "venta": 0,
+                      "fecha": "--/--/----",
+                      "actualizado": actualizado
+                  }
+          else:
+              salida = {
+                  "compra": compra,
+                  "venta": venta,
+                  "fecha": fecha_encontrada,
+                  "actualizado": actualizado
+              }
+
+          with open("tipocambio.json", "w", encoding="utf-8") as f:
+              json.dump(salida, f, ensure_ascii=False, indent=2)
+
+          print("tipocambio.json actualizado correctamente")
+          PY
+
+      - name: Guardar cambios
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tipocambio.json
+          git diff --cached --quiet || git commit -m "Actualiza tipo de cambio"
+          git push

@@ -1,0 +1,41 @@
+PASO A PASO
+
+1. Descargue este ZIP y descomprímalo.
+2. Entre a su repositorio en GitHub.
+3. Suba o reemplace estos archivos:
+   - index.html
+   - tipocambio.json
+   - .github/workflows/actualizar-tipocambio.yml
+   - README.md
+
+MÉTODO MÁS FÁCIL EN GITHUB
+1. Abra el repositorio.
+2. Vaya a Code.
+3. Suba `index.html`, `tipocambio.json` y `README.md`.
+4. Luego entre a `.github/workflows`.
+5. Abra `actualizar-tipocambio.yml`.
+6. Pulse el ícono del lápiz para editar.
+7. Borre el contenido actual.
+8. Pegue el nuevo contenido.
+9. Pulse Commit changes.
+
+VERIFICAR SECRET
+1. Settings
+2. Secrets and variables
+3. Actions
+4. Confirmar que exista `BCCR_TOKEN`
+
+PROBAR
+1. Actions
+2. Actualizar tipo de cambio
+3. Run workflow
+4. Revisar `tipocambio.json`
+
+HORARIO EN COSTA RICA
+El cron configurado es:
+0 9,12,15 * * *
+
+Eso equivale a:
+- 3:00 a. m.
+- 6:00 a. m.
+- 9:00 a. m.
