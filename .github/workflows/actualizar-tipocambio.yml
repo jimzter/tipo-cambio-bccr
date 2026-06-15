@@ -1,4 +1,4 @@
-```yaml
+
 name: Actualizar tipo de cambio
 
 on:
@@ -257,4 +257,10 @@ jobs:
           # Descarga cualquier cambio remoto antes de subir el nuevo JSON.
           git pull --rebase origin main
           git push origin main
-```
+
+
+
+
+
+
+
