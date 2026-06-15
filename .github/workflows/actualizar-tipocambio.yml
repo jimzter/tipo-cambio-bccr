@@ -1,20 +1,34 @@
+```yaml
 name: Actualizar tipo de cambio
 
 on:
+  # Permite ejecutar el flujo manualmente desde la pestaña Actions.
   workflow_dispatch:
+
+  # Ejecución automática en hora de Costa Rica:
+  # 3:17 a. m., 6:17 a. m. y 9:17 a. m.
   schedule:
-    - cron: "0 9,12,15 * * *"
+    - cron: "17 3,6,9 * * *"
+      timezone: "America/Costa_Rica"
 
 permissions:
   contents: write
 
+# Evita que una ejecución nueva se cruce con otra que todavía esté activa.
+concurrency:
+  group: actualizar-tipo-cambio
+  cancel-in-progress: false
+
 jobs:
   actualizar:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Configurar Python
         uses: actions/setup-python@v6
@@ -26,25 +40,50 @@ jobs:
           BCCR_TOKEN: ${{ secrets.BCCR_TOKEN }}
           BCCR_NOMBRE: jimmy
           BCCR_CORREO: jtellezsandoval@gmail.com
+
         run: |
           python - << 'PY'
           import json
           import os
           import re
           import html
+          import sys
+
           from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from urllib.parse import urlencode
-          from urllib.request import urlopen
+          from urllib.request import Request, urlopen
           from urllib.error import HTTPError, URLError
 
-          token = os.environ["BCCR_TOKEN"]
-          nombre = os.environ["BCCR_NOMBRE"]
-          correo = os.environ["BCCR_CORREO"]
+          token = os.environ.get("BCCR_TOKEN", "").strip()
+          nombre = os.environ.get("BCCR_NOMBRE", "").strip()
+          correo = os.environ.get("BCCR_CORREO", "").strip()
+
+          if not token:
+              print("ERROR: No está configurado el secreto BCCR_TOKEN.")
+              sys.exit(1)
+
+          if not nombre or not correo:
+              print("ERROR: Faltan BCCR_NOMBRE o BCCR_CORREO.")
+              sys.exit(1)
 
           zona_cr = ZoneInfo("America/Costa_Rica")
           ahora_cr = datetime.now(zona_cr)
           actualizado = ahora_cr.strftime("%d/%m/%Y %H:%M:%S")
+
+          def convertir_valor(valor_texto):
+              """
+              Convierte de forma segura el valor recibido por el BCCR.
+              Admite números con punto o coma decimal.
+              """
+              valor_texto = valor_texto.strip()
+
+              if "," in valor_texto and "." not in valor_texto:
+                  valor_texto = valor_texto.replace(",", ".")
+              elif "," in valor_texto and "." in valor_texto:
+                  valor_texto = valor_texto.replace(",", "")
+
+              return round(float(valor_texto), 2)
 
           def consultar(indicador, fecha_texto):
               params = {
@@ -59,83 +98,163 @@ jobs:
 
               url = (
                   "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
-                  "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML?"
+                  "wsindicadoreseconomicos.asmx/"
+                  "ObtenerIndicadoresEconomicosXML?"
                   + urlencode(params)
               )
 
-              try:
-                  with urlopen(url, timeout=60) as response:
-                      raw = response.read().decode("utf-8", errors="ignore")
-              except HTTPError as e:
-                  print(f"HTTPError {e.code} para indicador {indicador} en fecha {fecha_texto}")
-                  return None
-              except URLError as e:
-                  print(f"URLError para indicador {indicador} en fecha {fecha_texto}: {e}")
-                  return None
-              except Exception as e:
-                  print(f"Error inesperado para indicador {indicador} en fecha {fecha_texto}: {e}")
-                  return None
-
-              data = html.unescape(raw)
-              m_valor = re.search(r"<NUM_VALOR>(.*?)</NUM_VALOR>", data, re.S)
-
-              if not m_valor:
-                  print(f"No se encontró NUM_VALOR para indicador {indicador} en fecha {fecha_texto}")
-                  return None
+              request = Request(
+                  url,
+                  headers={
+                      "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/1.0",
+                      "Accept": "application/xml,text/xml,*/*"
+                  }
+              )
 
               try:
-                  return float(m_valor.group(1).strip())
-              except Exception:
+                  with urlopen(request, timeout=45) as response:
+                      raw = response.read().decode(
+                          "utf-8",
+                          errors="ignore"
+                      )
+
+              except HTTPError as error:
+                  print(
+                      f"HTTP {error.code}: indicador {indicador}, "
+                      f"fecha {fecha_texto}"
+                  )
+                  return None
+
+              except URLError as error:
+                  print(
+                      f"Error de conexión: indicador {indicador}, "
+                      f"fecha {fecha_texto}: {error}"
+                  )
+                  return None
+
+              except TimeoutError:
+                  print(
+                      f"Tiempo de espera agotado: indicador {indicador}, "
+                      f"fecha {fecha_texto}"
+                  )
+                  return None
+
+              except Exception as error:
+                  print(
+                      f"Error inesperado: indicador {indicador}, "
+                      f"fecha {fecha_texto}: {error}"
+                  )
+                  return None
+
+              # El servicio puede devolver XML escapado dentro de otro XML.
+              data = raw
+
+              for _ in range(3):
+                  nuevo_data = html.unescape(data)
+
+                  if nuevo_data == data:
+                      break
+
+                  data = nuevo_data
+
+              coincidencia = re.search(
+                  r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
+                  data,
+                  re.IGNORECASE | re.DOTALL
+              )
+
+              if not coincidencia:
+                  print(
+                      f"No se encontró NUM_VALOR para el indicador "
+                      f"{indicador} en {fecha_texto}"
+                  )
+                  return None
+
+              try:
+                  return convertir_valor(coincidencia.group(1))
+
+              except (TypeError, ValueError) as error:
+                  print(
+                      f"El valor recibido no es válido para el indicador "
+                      f"{indicador}: {error}"
+                  )
                   return None
 
           fecha_encontrada = None
           compra = None
           venta = None
 
-          for i in range(0, 8):
-              fecha_prueba = ahora_cr - timedelta(days=i)
+          # Busca desde la fecha actual hasta siete días anteriores.
+          # Esto permite cubrir fines de semana y días feriados.
+          for dias_atras in range(8):
+              fecha_prueba = ahora_cr - timedelta(days=dias_atras)
               fecha_texto = fecha_prueba.strftime("%d/%m/%Y")
 
-              compra_temp = consultar("317", fecha_texto)
-              venta_temp = consultar("318", fecha_texto)
+              print(f"Consultando valores para {fecha_texto}...")
 
-              if compra_temp is not None and venta_temp is not None:
+              compra_temporal = consultar("317", fecha_texto)
+              venta_temporal = consultar("318", fecha_texto)
+
+              if (
+                  compra_temporal is not None
+                  and venta_temporal is not None
+              ):
                   fecha_encontrada = fecha_texto
-                  compra = compra_temp
-                  venta = venta_temp
+                  compra = compra_temporal
+                  venta = venta_temporal
                   break
 
           if compra is None or venta is None:
-              print("No se encontró un valor nuevo; se conserva el JSON actual.")
-              if os.path.exists("tipocambio.json"):
-                  with open("tipocambio.json", "r", encoding="utf-8") as f:
-                      salida = json.load(f)
-                  salida["actualizado"] = actualizado
-              else:
-                  salida = {
-                      "compra": 0,
-                      "venta": 0,
-                      "fecha": "--/--/----",
-                      "actualizado": actualizado
-                  }
-          else:
-              salida = {
-                  "compra": compra,
-                  "venta": venta,
-                  "fecha": fecha_encontrada,
-                  "actualizado": actualizado
-              }
+              print(
+                  "ERROR: No fue posible obtener valores válidos del BCCR "
+                  "durante los últimos ocho días."
+              )
+              sys.exit(1)
 
-          with open("tipocambio.json", "w", encoding="utf-8") as f:
-              json.dump(salida, f, ensure_ascii=False, indent=2)
+          salida = {
+              "compra": compra,
+              "venta": venta,
+              "fecha": fecha_encontrada,
+              "actualizado": actualizado
+          }
 
-          print("tipocambio.json actualizado correctamente")
+          with open(
+              "tipocambio.json",
+              "w",
+              encoding="utf-8",
+              newline="\n"
+          ) as archivo:
+              json.dump(
+                  salida,
+                  archivo,
+                  ensure_ascii=False,
+                  indent=2
+              )
+              archivo.write("\n")
+
+          print("tipocambio.json generado correctamente.")
+          print(f"Compra: {compra}")
+          print(f"Venta: {venta}")
+          print(f"Fecha del BCCR: {fecha_encontrada}")
+          print(f"Consulta realizada: {actualizado}")
           PY
 
       - name: Guardar cambios
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add tipocambio.json
-          git diff --cached --quiet || git commit -m "Actualiza tipo de cambio"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "El archivo no presenta cambios para guardar."
+            exit 0
+          fi
+
+          git commit -m "Actualiza tipo de cambio del BCCR"
+
+          # Descarga cualquier cambio remoto antes de subir el nuevo JSON.
+          git pull --rebase origin main
+          git push origin main
+```
