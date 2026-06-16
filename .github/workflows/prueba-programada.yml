@@ -1,16 +1,15 @@
 name: Prueba programada automática
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7,17,27,37,47,57 * * * *"
 
 jobs:
   prueba:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Mostrar fecha y hora
+      - name: Confirmar ejecución automática
         run: |
-          echo "Ejecución automática iniciada"
-          date
+          echo "El evento schedule funciona correctamente"
+          date -u
