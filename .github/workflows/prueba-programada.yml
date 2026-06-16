@@ -1,4 +1,4 @@
-name: Prueba programada
+name: Prueba programada automática
 
 on:
   workflow_dispatch:
