@@ -1,0 +1,16 @@
+name: Prueba programada
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Mostrar fecha y hora
+        run: |
+          echo "Ejecución automática iniciada"
+          date
