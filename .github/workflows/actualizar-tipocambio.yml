@@ -1,13 +1,11 @@
 name: Actualizar tipo de cambio
 
 on:
-  # Permite ejecutar el flujo manualmente desde la pestaña Actions.
   workflow_dispatch:
 
-  # Prueba automática.
-  # GitHub Actions interpreta los horarios cron en UTC.
+  # Prueba temporal: ejecución automática cada 5 minutos.
   schedule:
-    - cron: "15 19 * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
