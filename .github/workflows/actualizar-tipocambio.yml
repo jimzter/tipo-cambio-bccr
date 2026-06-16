@@ -9,7 +9,7 @@ on:
   # Los siguientes horarios equivalen en Costa Rica a:
   # 3:17 a. m., 6:17 a. m. y 9:17 a. m.
   schedule:
-    - cron: "17 9,12,15 * * *"
+    - cron: "30 16 * * *"
 
 permissions:
   contents: write
