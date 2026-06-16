@@ -3,9 +3,9 @@ name: Actualizar tipo de cambio
 on:
   workflow_dispatch:
 
-  # Prueba temporal: ejecución automática cada 5 minutos.
+  # Prueba temporal del programador de GitHub.
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2,12,22,32,42,52 * * * *"
 
 permissions:
   contents: write
