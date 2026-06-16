@@ -5,11 +5,11 @@ on:
   # Permite ejecutar el flujo manualmente desde la pestaña Actions.
   workflow_dispatch:
 
-  # Ejecución automática en hora de Costa Rica:
+  # GitHub Actions interpreta los horarios cron en UTC.
+  # Los siguientes horarios equivalen en Costa Rica a:
   # 3:17 a. m., 6:17 a. m. y 9:17 a. m.
   schedule:
-    - cron: "17 3,6,9 * * *"
-      timezone: "America/Costa_Rica"
+    - cron: "17 9,12,15 * * *"
 
 permissions:
   contents: write
@@ -257,10 +257,4 @@ jobs:
           # Descarga cualquier cambio remoto antes de subir el nuevo JSON.
           git pull --rebase origin main
           git push origin main
-
-
-
-
-
-
 
