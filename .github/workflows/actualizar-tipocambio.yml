@@ -1,11 +1,14 @@
+
 name: Actualizar tipo de cambio
 
 on:
   workflow_dispatch:
 
-  # Prueba temporal del programador de GitHub.
+  # GitHub Actions usa horario UTC.
+  # Equivalente en Costa Rica:
+  # 6:17 a. m., 9:17 a. m. y 4:17 p. m.
   schedule:
-    - cron: "2,12,22,32,42,52 * * * *"
+    - cron: "17 12,15,22 * * *"
 
 permissions:
   contents: write
@@ -68,10 +71,6 @@ jobs:
           actualizado = ahora_cr.strftime("%d/%m/%Y %H:%M:%S")
 
           def convertir_valor(valor_texto):
-              """
-              Convierte de forma segura el valor recibido por el BCCR.
-              Admite números con punto o coma decimal.
-              """
               valor_texto = valor_texto.strip()
 
               if "," in valor_texto and "." not in valor_texto:
