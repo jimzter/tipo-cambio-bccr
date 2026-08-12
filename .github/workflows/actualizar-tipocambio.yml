@@ -1,19 +1,17 @@
-
 name: Actualizar tipo de cambio
 
 on:
   workflow_dispatch:
-
-  # GitHub Actions usa horario UTC.
-  # Equivalente en Costa Rica:
-  # 6:17 a. m., 9:17 a. m. y 4:17 p. m.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/actualizar-tipocambio.yml"
   schedule:
     - cron: "17 12,15,22 * * *"
 
 permissions:
   contents: write
 
-# Evita que una ejecución nueva se cruce con otra que todavía esté activa.
 concurrency:
   group: actualizar-tipo-cambio
   cancel-in-progress: false
@@ -39,7 +37,6 @@ jobs:
           BCCR_TOKEN: ${{ secrets.BCCR_TOKEN }}
           BCCR_NOMBRE: jimmy
           BCCR_CORREO: jtellezsandoval@gmail.com
-
         run: |
           python - << 'PY'
           import html
@@ -48,7 +45,6 @@ jobs:
           import re
           import sys
           import time
-
           from datetime import datetime, timedelta
           from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode
@@ -60,86 +56,54 @@ jobs:
           correo = os.environ.get("BCCR_CORREO", "").strip()
 
           if not token:
-              print("ERROR: No está configurado el secreto BCCR_TOKEN.")
+              print("ERROR: No está configurado BCCR_TOKEN.")
               sys.exit(1)
 
-          if not nombre or not correo:
-              print("ERROR: Faltan BCCR_NOMBRE o BCCR_CORREO.")
-              sys.exit(1)
-
-          zona_cr = ZoneInfo("America/Costa_Rica")
-          ahora_cr = datetime.now(zona_cr)
-          actualizado = ahora_cr.strftime("%d/%m/%Y %H:%M:%S")
-
-          fecha_final = ahora_cr.strftime("%d/%m/%Y")
-          fecha_inicio = (ahora_cr - timedelta(days=7)).strftime("%d/%m/%Y")
+          zona = ZoneInfo("America/Costa_Rica")
+          ahora = datetime.now(zona)
+          inicio = (ahora - timedelta(days=7)).strftime("%d/%m/%Y")
+          final = ahora.strftime("%d/%m/%Y")
+          actualizado = ahora.strftime("%d/%m/%Y %H:%M:%S")
 
           endpoint = (
               "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
               "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
           )
 
-          def convertir_valor(valor_texto):
-              valor_texto = valor_texto.strip()
+          def valor_numero(texto):
+              texto = texto.strip()
+              if "," in texto and "." not in texto:
+                  texto = texto.replace(",", ".")
+              elif "," in texto and "." in texto:
+                  texto = texto.replace(",", "")
+              return round(float(texto), 2)
 
-              if "," in valor_texto and "." not in valor_texto:
-                  valor_texto = valor_texto.replace(",", ".")
-              elif "," in valor_texto and "." in valor_texto:
-                  valor_texto = valor_texto.replace(",", "")
-
-              return round(float(valor_texto), 2)
-
-          def normalizar_fecha(fecha_texto):
-              fecha_texto = fecha_texto.strip()
-
-              formatos = (
-                  "%Y-%m-%dT%H:%M:%S",
-                  "%Y-%m-%d %H:%M:%S",
-                  "%Y-%m-%d",
-                  "%d/%m/%Y",
-              )
-
-              for formato in formatos:
-                  try:
-                      return datetime.strptime(fecha_texto[:19], formato).date()
-                  except ValueError:
-                      continue
-
-              # Algunos XML incluyen fracciones de segundo o zona horaria.
-              coincidencia = re.search(r"(\d{4}-\d{2}-\d{2})", fecha_texto)
-              if coincidencia:
-                  return datetime.strptime(
-                      coincidencia.group(1), "%Y-%m-%d"
-                  ).date()
-
-              raise ValueError(f"Formato de fecha no reconocido: {fecha_texto}")
+          def fecha_valida(texto):
+              texto = texto.strip()
+              m = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
+              if m:
+                  return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+              return datetime.strptime(texto[:10], "%d/%m/%Y").date()
 
           def consultar(indicador):
-              params = {
+              datos = urlencode({
                   "Indicador": indicador,
-                  "FechaInicio": fecha_inicio,
-                  "FechaFinal": fecha_final,
+                  "FechaInicio": inicio,
+                  "FechaFinal": final,
                   "Nombre": nombre,
                   "SubNiveles": "N",
                   "CorreoElectronico": correo,
                   "Token": token,
-              }
+              }).encode("utf-8")
 
-              cuerpo = urlencode(params).encode("utf-8")
-
-              esperas = (0, 5, 15, 30)
-
-              for intento, espera in enumerate(esperas, start=1):
+              for intento, espera in enumerate((0, 5, 15, 30), 1):
                   if espera:
-                      print(
-                          f"Esperando {espera} segundos antes del intento "
-                          f"{intento} para el indicador {indicador}..."
-                      )
+                      print(f"Reintento {intento} en {espera}s para {indicador}...")
                       time.sleep(espera)
 
-                  request = Request(
+                  req = Request(
                       endpoint,
-                      data=cuerpo,
+                      data=datos,
                       method="POST",
                       headers={
                           "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/2.0",
@@ -149,60 +113,28 @@ jobs:
                   )
 
                   try:
-                      with urlopen(request, timeout=60) as response:
-                          raw = response.read().decode(
-                              "utf-8", errors="ignore"
-                          )
-
-                      print(
-                          f"Respuesta recibida para indicador {indicador} "
-                          f"en el intento {intento}."
-                      )
-                      return raw
-
-                  except HTTPError as error:
+                      with urlopen(req, timeout=60) as r:
+                          return r.read().decode("utf-8", errors="ignore")
+                  except HTTPError as e:
                       detalle = ""
                       try:
-                          detalle = error.read().decode(
-                              "utf-8", errors="ignore"
-                          )[:500]
+                          detalle = e.read().decode("utf-8", errors="ignore")[:500]
                       except Exception:
                           pass
-
-                      print(
-                          f"HTTP {error.code}: indicador {indicador}, "
-                          f"intento {intento}."
-                      )
-
+                      print(f"HTTP {e.code}: indicador {indicador}, intento {intento}")
                       if detalle:
-                          print(
-                              "Respuesta del servidor (primeros 500 caracteres): "
-                              + detalle.replace("\n", " ")
-                          )
-
-                      if error.code not in (429, 500, 502, 503, 504):
+                          print("Detalle:", detalle.replace("\n", " "))
+                      if e.code not in (429, 500, 502, 503, 504):
                           return None
-
-                  except (URLError, TimeoutError) as error:
-                      print(
-                          f"Error de conexión para indicador {indicador}, "
-                          f"intento {intento}: {error}"
-                      )
-
-                  except Exception as error:
-                      print(
-                          f"Error inesperado para indicador {indicador}, "
-                          f"intento {intento}: {error}"
-                      )
+                  except (URLError, TimeoutError) as e:
+                      print(f"Conexión fallida para {indicador}, intento {intento}: {e}")
+                  except Exception as e:
+                      print(f"Error inesperado para {indicador}: {e}")
                       return None
 
-              print(
-                  f"No fue posible obtener el indicador {indicador} "
-                  "después de los reintentos."
-              )
               return None
 
-          def extraer_registros(raw, indicador):
+          def extraer(raw, indicador):
               if not raw:
                   return {}
 
@@ -213,136 +145,60 @@ jobs:
                       break
                   data = nuevo
 
+              fechas = re.findall(
+                  r"<DES_FECHA>\s*(.*?)\s*</DES_FECHA>",
+                  data, re.I | re.S
+              )
+              valores = re.findall(
+                  r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
+                  data, re.I | re.S
+              )
+
               registros = {}
-
-              bloques = re.findall(
-                  r"<INGC011_CAT_INDICADORECONOMIC[^>]*>(.*?)"
-                  r"</INGC011_CAT_INDICADORECONOMIC[^>]*>",
-                  data,
-                  re.IGNORECASE | re.DOTALL,
-              )
-
-              if not bloques:
-                  # Compatibilidad por si el servicio devuelve una estructura
-                  # simplificada distinta a la habitual.
-                  bloques = re.findall(
-                      r"<(?:Table|INGC011_CAT_INDICADORECONOMIC)>"
-                      r"(.*?)"
-                      r"</(?:Table|INGC011_CAT_INDICADORECONOMIC)>",
-                      data,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-
-              for bloque in bloques:
-                  valor_match = re.search(
-                      r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
-                      bloque,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-                  fecha_match = re.search(
-                      r"<DES_FECHA>\s*(.*?)\s*</DES_FECHA>",
-                      bloque,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-
-                  if not valor_match or not fecha_match:
-                      continue
-
+              for f, v in zip(fechas, valores):
                   try:
-                      fecha = normalizar_fecha(fecha_match.group(1))
-                      valor = convertir_valor(valor_match.group(1))
-                      registros[fecha] = valor
-                  except (TypeError, ValueError) as error:
-                      print(
-                          f"Registro inválido para indicador {indicador}: {error}"
-                      )
+                      registros[fecha_valida(f)] = valor_numero(v)
+                  except (ValueError, TypeError):
+                      pass
 
-              # Respaldo: si la respuesta solo contiene un valor y una fecha.
-              if not registros:
-                  valores = re.findall(
-                      r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
-                      data,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-                  fechas = re.findall(
-                      r"<DES_FECHA>\s*(.*?)\s*</DES_FECHA>",
-                      data,
-                      re.IGNORECASE | re.DOTALL,
-                  )
-
-                  for fecha_texto, valor_texto in zip(fechas, valores):
-                      try:
-                          fecha = normalizar_fecha(fecha_texto)
-                          registros[fecha] = convertir_valor(valor_texto)
-                      except (TypeError, ValueError):
-                          continue
-
-              print(
-                  f"Indicador {indicador}: {len(registros)} registro(s) válido(s)."
-              )
+              print(f"Indicador {indicador}: {len(registros)} registro(s) válido(s).")
               return registros
 
-          print(
-              f"Consultando BCCR desde {fecha_inicio} hasta {fecha_final}..."
-          )
+          print(f"Consultando BCCR desde {inicio} hasta {final}...")
+          compras = extraer(consultar("317"), "317")
+          ventas = extraer(consultar("318"), "318")
 
-          compra_raw = consultar("317")
-          venta_raw = consultar("318")
-
-          compras = extraer_registros(compra_raw, "317")
-          ventas = extraer_registros(venta_raw, "318")
-
-          fechas_comunes = sorted(
-              set(compras.keys()) & set(ventas.keys()),
-              reverse=True,
-          )
-
-          if not fechas_comunes:
+          comunes = sorted(set(compras) & set(ventas), reverse=True)
+          if not comunes:
               print(
-                  "ADVERTENCIA: No fue posible obtener valores nuevos y "
-                  "coincidentes del BCCR. Se conservará el último JSON válido."
+                  "ADVERTENCIA: El BCCR no devolvió valores nuevos. "
+                  "Se conserva el último tipocambio.json válido."
               )
               sys.exit(0)
 
-          fecha_elegida = fechas_comunes[0]
-          compra = compras[fecha_elegida]
-          venta = ventas[fecha_elegida]
-          fecha_encontrada = fecha_elegida.strftime("%d/%m/%Y")
-
+          fecha = comunes[0]
           salida = {
-              "compra": compra,
-              "venta": venta,
-              "fecha": fecha_encontrada,
+              "compra": compras[fecha],
+              "venta": ventas[fecha],
+              "fecha": fecha.strftime("%d/%m/%Y"),
               "actualizado": actualizado,
           }
 
-          with open(
-              "tipocambio.json",
-              "w",
-              encoding="utf-8",
-              newline="\n",
-          ) as archivo:
-              json.dump(
-                  salida,
-                  archivo,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-              archivo.write("\n")
+          with open("tipocambio.json", "w", encoding="utf-8", newline="\n") as f:
+              json.dump(salida, f, ensure_ascii=False, indent=2)
+              f.write("\n")
 
           print("tipocambio.json generado correctamente.")
-          print(f"Compra: {compra}")
-          print(f"Venta: {venta}")
-          print(f"Fecha del BCCR: {fecha_encontrada}")
-          print(f"Consulta realizada: {actualizado}")
+          print("Compra:", salida["compra"])
+          print("Venta:", salida["venta"])
+          print("Fecha del BCCR:", salida["fecha"])
+          print("Consulta realizada:", salida["actualizado"])
           PY
 
       - name: Guardar cambios
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tipocambio.json
 
           if git diff --cached --quiet; then
@@ -351,7 +207,5 @@ jobs:
           fi
 
           git commit -m "Actualiza tipo de cambio del BCCR"
-
-          # Descarga cualquier cambio remoto antes de subir el nuevo JSON.
           git pull --rebase origin main
           git push origin main
