@@ -19,7 +19,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - name: Descargar repositorio
@@ -55,10 +55,6 @@ jobs:
           nombre = os.environ.get("BCCR_NOMBRE", "").strip()
           correo = os.environ.get("BCCR_CORREO", "").strip()
 
-          if not token:
-              print("ERROR: No está configurado BCCR_TOKEN.")
-              sys.exit(1)
-
           zona = ZoneInfo("America/Costa_Rica")
           ahora = datetime.now(zona)
           inicio = (ahora - timedelta(days=7)).strftime("%d/%m/%Y")
@@ -69,13 +65,14 @@ jobs:
               "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
               "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
           )
+          pagina_oficial = "https://www.bccr.fi.cr/SitePages/Inicio.aspx"
 
           def valor_numero(texto):
-              texto = texto.strip()
+              texto = texto.strip().replace("\xa0", "")
               if "," in texto and "." not in texto:
                   texto = texto.replace(",", ".")
               elif "," in texto and "." in texto:
-                  texto = texto.replace(",", "")
+                  texto = texto.replace(".", "").replace(",", ".")
               return round(float(texto), 2)
 
           def fecha_valida(texto):
@@ -85,7 +82,11 @@ jobs:
                   return datetime.strptime(m.group(1), "%Y-%m-%d").date()
               return datetime.strptime(texto[:10], "%d/%m/%Y").date()
 
-          def consultar(indicador):
+          def consultar_ws(indicador):
+              if not token:
+                  print("BCCR_TOKEN no está configurado; se intentará la fuente oficial de respaldo.")
+                  return None
+
               datos = urlencode({
                   "Indicador": indicador,
                   "FechaInicio": inicio,
@@ -106,7 +107,7 @@ jobs:
                       data=datos,
                       method="POST",
                       headers={
-                          "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/2.0",
+                          "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/3.0",
                           "Accept": "application/xml,text/xml,*/*",
                           "Content-Type": "application/x-www-form-urlencoded",
                       },
@@ -116,14 +117,7 @@ jobs:
                       with urlopen(req, timeout=60) as r:
                           return r.read().decode("utf-8", errors="ignore")
                   except HTTPError as e:
-                      detalle = ""
-                      try:
-                          detalle = e.read().decode("utf-8", errors="ignore")[:500]
-                      except Exception:
-                          pass
                       print(f"HTTP {e.code}: indicador {indicador}, intento {intento}")
-                      if detalle:
-                          print("Detalle:", detalle.replace("\n", " "))
                       if e.code not in (429, 500, 502, 503, 504):
                           return None
                   except (URLError, TimeoutError) as e:
@@ -134,7 +128,7 @@ jobs:
 
               return None
 
-          def extraer(raw, indicador):
+          def extraer_ws(raw, indicador):
               if not raw:
                   return {}
 
@@ -164,24 +158,120 @@ jobs:
               print(f"Indicador {indicador}: {len(registros)} registro(s) válido(s).")
               return registros
 
-          print(f"Consultando BCCR desde {inicio} hasta {final}...")
-          compras = extraer(consultar("317"), "317")
-          ventas = extraer(consultar("318"), "318")
+          def consultar_pagina_oficial():
+              print("Intentando fuente oficial alternativa: página principal del BCCR...")
+
+              for intento, espera in enumerate((0, 5, 15), 1):
+                  if espera:
+                      time.sleep(espera)
+
+                  req = Request(
+                      pagina_oficial,
+                      headers={
+                          "User-Agent": (
+                              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/127 Safari/537.36"
+                          ),
+                          "Accept": "text/html,application/xhtml+xml,*/*",
+                          "Accept-Language": "es-CR,es;q=0.9,en;q=0.5",
+                      },
+                  )
+
+                  try:
+                      with urlopen(req, timeout=60) as r:
+                          raw = r.read().decode("utf-8", errors="ignore")
+
+                      texto = html.unescape(raw)
+                      texto = re.sub(r"<script\b[^>]*>.*?</script>", " ", texto, flags=re.I | re.S)
+                      texto = re.sub(r"<style\b[^>]*>.*?</style>", " ", texto, flags=re.I | re.S)
+                      texto = re.sub(r"<[^>]+>", " ", texto)
+                      texto = re.sub(r"\s+", " ", texto).strip()
+
+                      seccion = texto
+                      inicio_sec = re.search(
+                          r"TIPO\s+DE\s+CAMBIO\s+DE\s+REFERENCIA\s+Y\s+TASAS",
+                          texto,
+                          re.I,
+                      )
+                      if inicio_sec:
+                          seccion = texto[inicio_sec.start():inicio_sec.start() + 1200]
+
+                      compra_match = re.search(
+                          r"Compra\s+(?:USD\s*)?(?:₡|CRC)?\s*([0-9]{3}[,.][0-9]{2})",
+                          seccion,
+                          re.I,
+                      )
+                      venta_match = re.search(
+                          r"Venta\s+(?:USD\s*)?(?:₡|CRC)?\s*([0-9]{3}[,.][0-9]{2})",
+                          seccion,
+                          re.I,
+                      )
+
+                      if not compra_match or not venta_match:
+                          print(
+                              f"Intento {intento}: no se localizaron compra y venta "
+                              "en la página oficial."
+                          )
+                          continue
+
+                      compra = valor_numero(compra_match.group(1))
+                      venta = valor_numero(venta_match.group(1))
+
+                      if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
+                          print(
+                              f"Intento {intento}: valores fuera de rango esperado: "
+                              f"compra={compra}, venta={venta}."
+                          )
+                          continue
+
+                      print("Fuente oficial alternativa consultada correctamente.")
+                      return compra, venta
+
+                  except HTTPError as e:
+                      print(f"Página oficial BCCR: HTTP {e.code}, intento {intento}")
+                  except (URLError, TimeoutError) as e:
+                      print(f"Página oficial BCCR: error de conexión, intento {intento}: {e}")
+                  except Exception as e:
+                      print(f"Página oficial BCCR: error inesperado, intento {intento}: {e}")
+
+              return None
+
+          print(f"Consultando Web Service BCCR desde {inicio} hasta {final}...")
+          compras = extraer_ws(consultar_ws("317"), "317")
+          ventas = extraer_ws(consultar_ws("318"), "318")
 
           comunes = sorted(set(compras) & set(ventas), reverse=True)
-          if not comunes:
-              print(
-                  "ADVERTENCIA: El BCCR no devolvió valores nuevos. "
-                  "Se conserva el último tipocambio.json válido."
-              )
-              sys.exit(0)
+          fuente = "Web Service del Banco Central de Costa Rica"
 
-          fecha = comunes[0]
+          if comunes:
+              fecha = comunes[0]
+              compra = compras[fecha]
+              venta = ventas[fecha]
+              fecha_texto = fecha.strftime("%d/%m/%Y")
+          else:
+              print(
+                  "El Web Service no devolvió datos válidos. "
+                  "Se activará la fuente oficial de respaldo."
+              )
+              respaldo = consultar_pagina_oficial()
+
+              if not respaldo:
+                  print(
+                      "ADVERTENCIA: tampoco fue posible obtener valores desde la "
+                      "página oficial. Se conserva el último tipocambio.json válido."
+                  )
+                  sys.exit(0)
+
+              compra, venta = respaldo
+              fecha_texto = ahora.strftime("%d/%m/%Y")
+              fuente = "Página oficial del Banco Central de Costa Rica"
+
           salida = {
-              "compra": compras[fecha],
-              "venta": ventas[fecha],
-              "fecha": fecha.strftime("%d/%m/%Y"),
+              "compra": compra,
+              "venta": venta,
+              "fecha": fecha_texto,
               "actualizado": actualizado,
+              "fuente": fuente,
           }
 
           with open("tipocambio.json", "w", encoding="utf-8", newline="\n") as f:
@@ -191,8 +281,9 @@ jobs:
           print("tipocambio.json generado correctamente.")
           print("Compra:", salida["compra"])
           print("Venta:", salida["venta"])
-          print("Fecha del BCCR:", salida["fecha"])
-          print("Consulta realizada:", salida["actualizado"])
+          print("Fecha:", salida["fecha"])
+          print("Actualizado:", salida["actualizado"])
+          print("Fuente utilizada:", salida["fuente"])
           PY
 
       - name: Guardar cambios
