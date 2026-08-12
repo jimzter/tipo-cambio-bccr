@@ -21,7 +21,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Descargar repositorio
@@ -42,17 +42,18 @@ jobs:
 
         run: |
           python - << 'PY'
+          import html
           import json
           import os
           import re
-          import html
           import sys
+          import time
 
           from datetime import datetime, timedelta
-          from zoneinfo import ZoneInfo
+          from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
-          from urllib.error import HTTPError, URLError
+          from zoneinfo import ZoneInfo
 
           token = os.environ.get("BCCR_TOKEN", "").strip()
           nombre = os.environ.get("BCCR_NOMBRE", "").strip()
@@ -70,6 +71,14 @@ jobs:
           ahora_cr = datetime.now(zona_cr)
           actualizado = ahora_cr.strftime("%d/%m/%Y %H:%M:%S")
 
+          fecha_final = ahora_cr.strftime("%d/%m/%Y")
+          fecha_inicio = (ahora_cr - timedelta(days=7)).strftime("%d/%m/%Y")
+
+          endpoint = (
+              "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
+              "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
+          )
+
           def convertir_valor(valor_texto):
               valor_texto = valor_texto.strip()
 
@@ -80,150 +89,244 @@ jobs:
 
               return round(float(valor_texto), 2)
 
-          def consultar(indicador, fecha_texto):
+          def normalizar_fecha(fecha_texto):
+              fecha_texto = fecha_texto.strip()
+
+              formatos = (
+                  "%Y-%m-%dT%H:%M:%S",
+                  "%Y-%m-%d %H:%M:%S",
+                  "%Y-%m-%d",
+                  "%d/%m/%Y",
+              )
+
+              for formato in formatos:
+                  try:
+                      return datetime.strptime(fecha_texto[:19], formato).date()
+                  except ValueError:
+                      continue
+
+              # Algunos XML incluyen fracciones de segundo o zona horaria.
+              coincidencia = re.search(r"(\d{4}-\d{2}-\d{2})", fecha_texto)
+              if coincidencia:
+                  return datetime.strptime(
+                      coincidencia.group(1), "%Y-%m-%d"
+                  ).date()
+
+              raise ValueError(f"Formato de fecha no reconocido: {fecha_texto}")
+
+          def consultar(indicador):
               params = {
                   "Indicador": indicador,
-                  "FechaInicio": fecha_texto,
-                  "FechaFinal": fecha_texto,
+                  "FechaInicio": fecha_inicio,
+                  "FechaFinal": fecha_final,
                   "Nombre": nombre,
                   "SubNiveles": "N",
                   "CorreoElectronico": correo,
-                  "Token": token
+                  "Token": token,
               }
 
-              url = (
-                  "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
-                  "wsindicadoreseconomicos.asmx/"
-                  "ObtenerIndicadoresEconomicosXML?"
-                  + urlencode(params)
-              )
+              cuerpo = urlencode(params).encode("utf-8")
 
-              request = Request(
-                  url,
-                  headers={
-                      "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/1.0",
-                      "Accept": "application/xml,text/xml,*/*"
-                  }
-              )
+              esperas = (0, 5, 15, 30)
 
-              try:
-                  with urlopen(request, timeout=45) as response:
-                      raw = response.read().decode(
-                          "utf-8",
-                          errors="ignore"
+              for intento, espera in enumerate(esperas, start=1):
+                  if espera:
+                      print(
+                          f"Esperando {espera} segundos antes del intento "
+                          f"{intento} para el indicador {indicador}..."
+                      )
+                      time.sleep(espera)
+
+                  request = Request(
+                      endpoint,
+                      data=cuerpo,
+                      method="POST",
+                      headers={
+                          "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/2.0",
+                          "Accept": "application/xml,text/xml,*/*",
+                          "Content-Type": "application/x-www-form-urlencoded",
+                      },
+                  )
+
+                  try:
+                      with urlopen(request, timeout=60) as response:
+                          raw = response.read().decode(
+                              "utf-8", errors="ignore"
+                          )
+
+                      print(
+                          f"Respuesta recibida para indicador {indicador} "
+                          f"en el intento {intento}."
+                      )
+                      return raw
+
+                  except HTTPError as error:
+                      detalle = ""
+                      try:
+                          detalle = error.read().decode(
+                              "utf-8", errors="ignore"
+                          )[:500]
+                      except Exception:
+                          pass
+
+                      print(
+                          f"HTTP {error.code}: indicador {indicador}, "
+                          f"intento {intento}."
                       )
 
-              except HTTPError as error:
-                  print(
-                      f"HTTP {error.code}: indicador {indicador}, "
-                      f"fecha {fecha_texto}"
-                  )
-                  return None
+                      if detalle:
+                          print(
+                              "Respuesta del servidor (primeros 500 caracteres): "
+                              + detalle.replace("\n", " ")
+                          )
 
-              except URLError as error:
-                  print(
-                      f"Error de conexión: indicador {indicador}, "
-                      f"fecha {fecha_texto}: {error}"
-                  )
-                  return None
+                      if error.code not in (429, 500, 502, 503, 504):
+                          return None
 
-              except TimeoutError:
-                  print(
-                      f"Tiempo de espera agotado: indicador {indicador}, "
-                      f"fecha {fecha_texto}"
-                  )
-                  return None
+                  except (URLError, TimeoutError) as error:
+                      print(
+                          f"Error de conexión para indicador {indicador}, "
+                          f"intento {intento}: {error}"
+                      )
 
-              except Exception as error:
-                  print(
-                      f"Error inesperado: indicador {indicador}, "
-                      f"fecha {fecha_texto}: {error}"
-                  )
-                  return None
+                  except Exception as error:
+                      print(
+                          f"Error inesperado para indicador {indicador}, "
+                          f"intento {intento}: {error}"
+                      )
+                      return None
 
-              # El servicio puede devolver XML escapado dentro de otro XML.
-              data = raw
-
-              for _ in range(3):
-                  nuevo_data = html.unescape(data)
-
-                  if nuevo_data == data:
-                      break
-
-                  data = nuevo_data
-
-              coincidencia = re.search(
-                  r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
-                  data,
-                  re.IGNORECASE | re.DOTALL
-              )
-
-              if not coincidencia:
-                  print(
-                      f"No se encontró NUM_VALOR para el indicador "
-                      f"{indicador} en {fecha_texto}"
-                  )
-                  return None
-
-              try:
-                  return convertir_valor(coincidencia.group(1))
-
-              except (TypeError, ValueError) as error:
-                  print(
-                      f"El valor recibido no es válido para el indicador "
-                      f"{indicador}: {error}"
-                  )
-                  return None
-
-          fecha_encontrada = None
-          compra = None
-          venta = None
-
-          # Busca desde la fecha actual hasta siete días anteriores.
-          # Esto permite cubrir fines de semana y días feriados.
-          for dias_atras in range(8):
-              fecha_prueba = ahora_cr - timedelta(days=dias_atras)
-              fecha_texto = fecha_prueba.strftime("%d/%m/%Y")
-
-              print(f"Consultando valores para {fecha_texto}...")
-
-              compra_temporal = consultar("317", fecha_texto)
-              venta_temporal = consultar("318", fecha_texto)
-
-              if (
-                  compra_temporal is not None
-                  and venta_temporal is not None
-              ):
-                  fecha_encontrada = fecha_texto
-                  compra = compra_temporal
-                  venta = venta_temporal
-                  break
-
-          if compra is None or venta is None:
               print(
-                  "ERROR: No fue posible obtener valores válidos del BCCR "
-                  "durante los últimos ocho días."
+                  f"No fue posible obtener el indicador {indicador} "
+                  "después de los reintentos."
               )
-              sys.exit(1)
+              return None
+
+          def extraer_registros(raw, indicador):
+              if not raw:
+                  return {}
+
+              data = raw
+              for _ in range(4):
+                  nuevo = html.unescape(data)
+                  if nuevo == data:
+                      break
+                  data = nuevo
+
+              registros = {}
+
+              bloques = re.findall(
+                  r"<INGC011_CAT_INDICADORECONOMIC[^>]*>(.*?)"
+                  r"</INGC011_CAT_INDICADORECONOMIC[^>]*>",
+                  data,
+                  re.IGNORECASE | re.DOTALL,
+              )
+
+              if not bloques:
+                  # Compatibilidad por si el servicio devuelve una estructura
+                  # simplificada distinta a la habitual.
+                  bloques = re.findall(
+                      r"<(?:Table|INGC011_CAT_INDICADORECONOMIC)>"
+                      r"(.*?)"
+                      r"</(?:Table|INGC011_CAT_INDICADORECONOMIC)>",
+                      data,
+                      re.IGNORECASE | re.DOTALL,
+                  )
+
+              for bloque in bloques:
+                  valor_match = re.search(
+                      r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
+                      bloque,
+                      re.IGNORECASE | re.DOTALL,
+                  )
+                  fecha_match = re.search(
+                      r"<DES_FECHA>\s*(.*?)\s*</DES_FECHA>",
+                      bloque,
+                      re.IGNORECASE | re.DOTALL,
+                  )
+
+                  if not valor_match or not fecha_match:
+                      continue
+
+                  try:
+                      fecha = normalizar_fecha(fecha_match.group(1))
+                      valor = convertir_valor(valor_match.group(1))
+                      registros[fecha] = valor
+                  except (TypeError, ValueError) as error:
+                      print(
+                          f"Registro inválido para indicador {indicador}: {error}"
+                      )
+
+              # Respaldo: si la respuesta solo contiene un valor y una fecha.
+              if not registros:
+                  valores = re.findall(
+                      r"<NUM_VALOR>\s*(.*?)\s*</NUM_VALOR>",
+                      data,
+                      re.IGNORECASE | re.DOTALL,
+                  )
+                  fechas = re.findall(
+                      r"<DES_FECHA>\s*(.*?)\s*</DES_FECHA>",
+                      data,
+                      re.IGNORECASE | re.DOTALL,
+                  )
+
+                  for fecha_texto, valor_texto in zip(fechas, valores):
+                      try:
+                          fecha = normalizar_fecha(fecha_texto)
+                          registros[fecha] = convertir_valor(valor_texto)
+                      except (TypeError, ValueError):
+                          continue
+
+              print(
+                  f"Indicador {indicador}: {len(registros)} registro(s) válido(s)."
+              )
+              return registros
+
+          print(
+              f"Consultando BCCR desde {fecha_inicio} hasta {fecha_final}..."
+          )
+
+          compra_raw = consultar("317")
+          venta_raw = consultar("318")
+
+          compras = extraer_registros(compra_raw, "317")
+          ventas = extraer_registros(venta_raw, "318")
+
+          fechas_comunes = sorted(
+              set(compras.keys()) & set(ventas.keys()),
+              reverse=True,
+          )
+
+          if not fechas_comunes:
+              print(
+                  "ADVERTENCIA: No fue posible obtener valores nuevos y "
+                  "coincidentes del BCCR. Se conservará el último JSON válido."
+              )
+              sys.exit(0)
+
+          fecha_elegida = fechas_comunes[0]
+          compra = compras[fecha_elegida]
+          venta = ventas[fecha_elegida]
+          fecha_encontrada = fecha_elegida.strftime("%d/%m/%Y")
 
           salida = {
               "compra": compra,
               "venta": venta,
               "fecha": fecha_encontrada,
-              "actualizado": actualizado
+              "actualizado": actualizado,
           }
 
           with open(
               "tipocambio.json",
               "w",
               encoding="utf-8",
-              newline="\n"
+              newline="\n",
           ) as archivo:
               json.dump(
                   salida,
                   archivo,
                   ensure_ascii=False,
-                  indent=2
+                  indent=2,
               )
               archivo.write("\n")
 
@@ -252,4 +355,3 @@ jobs:
           # Descarga cualquier cambio remoto antes de subir el nuevo JSON.
           git pull --rebase origin main
           git push origin main
-
