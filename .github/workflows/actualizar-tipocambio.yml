@@ -19,7 +19,7 @@ concurrency:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Descargar repositorio
@@ -31,6 +31,12 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Instalar Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install chromium
 
       - name: Consultar BCCR y generar JSON
         env:
@@ -46,16 +52,17 @@ jobs:
           import sys
           import time
           from datetime import datetime, timedelta
-          from html.parser import HTMLParser
           from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
 
-          ZONA = ZoneInfo("America/Costa_Rica")
-          ahora = datetime.now(ZONA)
-          desde = ahora - timedelta(days=10)
-          inicio = desde.strftime("%d/%m/%Y")
+          from playwright.sync_api import sync_playwright
+
+          zona = ZoneInfo("America/Costa_Rica")
+          ahora = datetime.now(zona)
+          inicio_dt = ahora - timedelta(days=10)
+          inicio = inicio_dt.strftime("%d/%m/%Y")
           final = ahora.strftime("%d/%m/%Y")
           actualizado = ahora.strftime("%d/%m/%Y %H:%M:%S")
 
@@ -63,36 +70,20 @@ jobs:
           nombre = os.environ.get("BCCR_NOMBRE", "").strip()
           correo = os.environ.get("BCCR_CORREO", "").strip()
 
-          WS_URL = (
-              "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
-              "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
-          )
-
-          cuadro_params = urlencode({
-              "CodCuadro": "400",
-              "FecInicial": desde.strftime("%Y/%m/%d"),
-              "FecFinal": ahora.strftime("%Y/%m/%d"),
-              "Filtro": "0",
-              "Idioma": "1",
-          })
+          WS_BASE = "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/wsindicadoreseconomicos.asmx"
+          WS_XML = WS_BASE + "/ObtenerIndicadoresEconomicosXML"
+          WS_DATASET = WS_BASE + "/ObtenerIndicadoresEconomicos"
           CUADRO_URL = (
-              "https://gee.bccr.fi.cr/indicadoreseconomicos/Cuadros/"
-              f"frmVerCatCuadro.aspx?{cuadro_params}"
+              "https://gee.bccr.fi.cr/indicadoreseconomicos/Cuadros/frmVerCatCuadro.aspx"
+              "?CodCuadro=400&FecInicial=" + inicio_dt.strftime("%Y/%m/%d") +
+              "&FecFinal=" + ahora.strftime("%Y/%m/%d") +
+              "&Filtro=0&Idioma=1"
           )
-
-          class TextExtractor(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.partes = []
-
-              def handle_data(self, data):
-                  data = data.strip()
-                  if data:
-                      self.partes.append(data)
+          HOME_URL = "https://www.bccr.fi.cr/"
 
           def valor_numero(texto):
-              t = texto.strip().replace("\xa0", "").replace("₡", "")
-              t = t.replace("CRC", "").replace(" ", "")
+              t = texto.strip().replace("\xa0", "").replace("₡", "").replace("CRC", "")
+              t = t.replace(" ", "")
               if "," in t and "." not in t:
                   t = t.replace(",", ".")
               elif "," in t and "." in t:
@@ -102,44 +93,61 @@ jobs:
                       t = t.replace(",", "")
               return round(float(t), 2)
 
-          def fecha_ws(texto):
-              texto = texto.strip()
+          def parse_fecha(texto):
               m = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
               if m:
                   return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+              m = re.search(r"(\d{1,2})\s+(Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Set|Oct|Nov|Dic)\s+(\d{4})", texto, re.I)
+              if m:
+                  meses = {"ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,"jul":7,"ago":8,"sep":9,"set":9,"oct":10,"nov":11,"dic":12}
+                  return datetime(int(m.group(3)), meses[m.group(2).lower()], int(m.group(1))).date()
               m = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
               if m:
                   return datetime.strptime(m.group(1), "%d/%m/%Y").date()
-              raise ValueError(f"Fecha no reconocida: {texto}")
+              return None
 
-          def request(url, data=None, timeout=60):
+          def extraer_registros_xml(raw):
+              if not raw:
+                  return {}
+              data = raw
+              for _ in range(5):
+                  nuevo = html.unescape(data)
+                  if nuevo == data:
+                      break
+                  data = nuevo
+              fechas = re.findall(r"<(?:DES_FECHA|DESFECHA)>\s*(.*?)\s*</(?:DES_FECHA|DESFECHA)>", data, re.I | re.S)
+              valores = re.findall(r"<(?:NUM_VALOR|NUMVALOR)>\s*(.*?)\s*</(?:NUM_VALOR|NUMVALOR)>", data, re.I | re.S)
+              registros = {}
+              for f, v in zip(fechas, valores):
+                  try:
+                      fecha = parse_fecha(f)
+                      if fecha:
+                          registros[fecha] = valor_numero(v)
+                  except Exception:
+                      pass
+              return registros
+
+          def pedir(url, data=None, timeout=60):
               req = Request(
                   url,
                   data=data,
                   method="POST" if data is not None else "GET",
                   headers={
-                      "User-Agent": (
-                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/127.0 Safari/537.36"
-                      ),
+                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127 Safari/537.36",
                       "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*",
                       "Accept-Language": "es-CR,es;q=0.9,en;q=0.5",
-                      "Cache-Control": "no-cache",
-                      "Content-Type": "application/x-www-form-urlencoded" if data else "text/html",
+                      "Content-Type": "application/x-www-form-urlencoded" if data is not None else "text/html",
                   },
               )
               with urlopen(req, timeout=timeout) as r:
-                  raw = r.read().decode("utf-8", errors="ignore")
-                  print(f"HTTP {getattr(r, 'status', 200)} - {len(raw)} bytes")
-                  return raw
+                  return r.read().decode("utf-8", errors="ignore")
 
           def consultar_ws(indicador):
               if not token:
-                  print("BCCR_TOKEN no está configurado; se omite Web Service.")
+                  print("BCCR_TOKEN no configurado; se omite WS.")
                   return {}
 
-              datos = urlencode({
+              params = {
                   "Indicador": indicador,
                   "FechaInicio": inicio,
                   "FechaFinal": final,
@@ -147,185 +155,139 @@ jobs:
                   "SubNiveles": "N",
                   "CorreoElectronico": correo,
                   "Token": token,
-              }).encode("utf-8")
+              }
+              data = urlencode(params).encode("utf-8")
 
-              raw = None
+              # 1) XML por POST
               for intento, espera in enumerate((0, 5, 15), 1):
                   if espera:
-                      print(f"Reintento WS {indicador} en {espera}s...")
                       time.sleep(espera)
                   try:
-                      raw = request(WS_URL, datos)
-                      break
+                      raw = pedir(WS_XML, data)
+                      regs = extraer_registros_xml(raw)
+                      if regs:
+                          print(f"WS XML {indicador}: {len(regs)} registros.")
+                          return regs
                   except HTTPError as e:
-                      print(f"WS {indicador}: HTTP {e.code}, intento {intento}")
-                      if e.code not in (429, 500, 502, 503, 504):
-                          break
-                  except (URLError, TimeoutError) as e:
-                      print(f"WS {indicador}: error de conexión, intento {intento}: {e}")
-
-              if not raw:
-                  return {}
-
-              data = raw
-              for _ in range(5):
-                  nuevo = html.unescape(data)
-                  if nuevo == data:
-                      break
-                  data = nuevo
-
-              fechas = re.findall(
-                  r"<(?:DES_FECHA|DESFECHA)>\s*(.*?)\s*</(?:DES_FECHA|DESFECHA)>",
-                  data, re.I | re.S
-              )
-              valores = re.findall(
-                  r"<(?:NUM_VALOR|NUMVALOR)>\s*(.*?)\s*</(?:NUM_VALOR|NUMVALOR)>",
-                  data, re.I | re.S
-              )
-
-              registros = {}
-              for f, v in zip(fechas, valores):
-                  try:
-                      registros[fecha_ws(f)] = valor_numero(v)
+                      print(f"WS XML {indicador}: HTTP {e.code}, intento {intento}")
                   except Exception as e:
-                      print(f"WS {indicador}: registro descartado {f!r}/{v!r}: {e}")
+                      print(f"WS XML {indicador}: {e}")
 
-              print(f"WS {indicador}: {len(registros)} registro(s) válido(s).")
-              return registros
+              # 2) DataSet por GET como alternativa oficial
+              try:
+                  url = WS_DATASET + "?" + urlencode(params)
+                  raw = pedir(url)
+                  regs = extraer_registros_xml(raw)
+                  if regs:
+                      print(f"WS DataSet {indicador}: {len(regs)} registros.")
+                      return regs
+              except Exception as e:
+                  print(f"WS DataSet {indicador}: {e}")
 
-          MESES = {
-              "ene": 1, "feb": 2, "mar": 3, "abr": 4,
-              "may": 5, "jun": 6, "jul": 7, "ago": 8,
-              "sep": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12,
-          }
+              return {}
 
-          def parse_fecha_cuadro(texto):
-              m = re.fullmatch(
-                  r"(\d{1,2})\s+(Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Set|Oct|Nov|Dic)\s+(\d{4})",
-                  texto.strip(), re.I
-              )
-              if not m:
-                  return None
-              return datetime(
-                  int(m.group(3)), MESES[m.group(2).lower()], int(m.group(1))
-              ).date()
-
-          def consultar_cuadro_oficial():
-              print("Intentando respaldo: Cuadro 400 oficial del BCCR con rango de fechas...")
-              print(f"Rango cuadro: {desde.strftime('%Y/%m/%d')} a {ahora.strftime('%Y/%m/%d')}")
-
-              raw = None
-              for intento, espera in enumerate((0, 5, 15), 1):
-                  if espera:
-                      print(f"Reintento cuadro oficial en {espera}s...")
-                      time.sleep(espera)
-                  try:
-                      raw = request(CUADRO_URL)
-                      break
-                  except HTTPError as e:
-                      print(f"Cuadro oficial: HTTP {e.code}, intento {intento}")
-                  except (URLError, TimeoutError) as e:
-                      print(f"Cuadro oficial: error de conexión, intento {intento}: {e}")
-
-              if not raw:
-                  return None
-
-              parser = TextExtractor()
-              parser.feed(html.unescape(raw))
-              tokens = [re.sub(r"\s+", " ", x).strip() for x in parser.partes]
-
-              inicio_idx = 0
-              fin_idx = len(tokens)
-              for i, t in enumerate(tokens):
-                  if "TIPO CAMBIO COMPRA" in t.upper():
-                      inicio_idx = i
-                      break
-              for i in range(inicio_idx, len(tokens)):
-                  if tokens[i].upper().startswith("FUENTE"):
-                      fin_idx = i
-                      break
-
-              zona = tokens[inicio_idx:fin_idx]
+          def extraer_cuadro_texto(texto):
+              lineas = [re.sub(r"\s+", " ", x).strip() for x in texto.splitlines() if x.strip()]
               fechas = []
               numeros = []
-
-              for t in zona:
-                  f = parse_fecha_cuadro(t)
+              for linea in lineas:
+                  f = parse_fecha(linea)
                   if f:
                       fechas.append(f)
                       continue
-                  if re.fullmatch(r"\d{3}[,.]\d{2,5}", t):
+                  if re.fullmatch(r"\d{3}[,.]\d{2,5}", linea):
                       try:
-                          numeros.append(valor_numero(t))
-                      except ValueError:
+                          numeros.append(valor_numero(linea))
+                      except Exception:
                           pass
-
-              print(
-                  f"Cuadro oficial: {len(fechas)} fecha(s) y "
-                  f"{len(numeros)} valor(es) detectados."
-              )
-
               if not fechas or len(numeros) < len(fechas) * 2:
-                  print("Cuadro oficial: estructura inesperada.")
-                  print("Primeros tokens detectados:", tokens[:40])
                   return None
-
               n = len(fechas)
               compras = numeros[:n]
-              ventas = numeros[n:n * 2]
-
-              candidatos = [
-                  (f, compras[i], ventas[i])
-                  for i, f in enumerate(fechas)
-                  if f <= ahora.date()
-              ]
+              ventas = numeros[n:n*2]
+              candidatos = [(f, compras[i], ventas[i]) for i, f in enumerate(fechas) if f <= ahora.date()]
               if not candidatos:
                   return None
-
               f, compra, venta = max(candidatos, key=lambda x: x[0])
+              if 300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra:
+                  return f, compra, venta
+              return None
 
-              if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
-                  print(
-                      "Cuadro oficial: valores fuera de rango: "
-                      f"fecha={f}, compra={compra}, venta={venta}"
-                  )
+          def extraer_home_texto(texto):
+              limpio = re.sub(r"\s+", " ", texto)
+              mc = re.search(r"Compra\s+USD\s*₡?\s*([0-9]{3}[,.][0-9]{2})", limpio, re.I)
+              mv = re.search(r"Venta\s+USD\s*₡?\s*([0-9]{3}[,.][0-9]{2})", limpio, re.I)
+              if not mc or not mv:
+                  mc = re.search(r"\bCompra\b.{0,80}?([0-9]{3}[,.][0-9]{2})", limpio, re.I)
+                  mv = re.search(r"\bVenta\b.{0,80}?([0-9]{3}[,.][0-9]{2})", limpio, re.I)
+              if not mc or not mv:
                   return None
+              compra = valor_numero(mc.group(1))
+              venta = valor_numero(mv.group(1))
+              if 300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra:
+                  return ahora.date(), compra, venta
+              return None
 
-              print(
-                  "Cuadro oficial OK: "
-                  f"fecha={f.strftime('%d/%m/%Y')}, compra={compra}, venta={venta}"
-              )
-              return f, compra, venta
+          def consultar_con_navegador():
+              print("Intentando respaldo oficial con navegador Chromium...")
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  page = browser.new_page(locale="es-CR")
+
+                  # Cuadro 400
+                  try:
+                      print("Abriendo Cuadro 400:", CUADRO_URL)
+                      page.goto(CUADRO_URL, wait_until="domcontentloaded", timeout=60000)
+                      page.wait_for_timeout(3000)
+                      texto = page.locator("body").inner_text(timeout=10000)
+                      print("Cuadro 400: caracteres visibles:", len(texto))
+                      r = extraer_cuadro_texto(texto)
+                      if r:
+                          browser.close()
+                          print("Cuadro 400 OK:", r)
+                          return r, "Cuadro 400 del Banco Central de Costa Rica"
+                  except Exception as e:
+                      print("Cuadro 400 con navegador falló:", e)
+
+                  # Página principal oficial
+                  try:
+                      print("Abriendo página principal BCCR:", HOME_URL)
+                      page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                      page.wait_for_timeout(5000)
+                      texto = page.locator("body").inner_text(timeout=10000)
+                      print("Página principal: caracteres visibles:", len(texto))
+                      r = extraer_home_texto(texto)
+                      if r:
+                          browser.close()
+                          print("Página principal BCCR OK:", r)
+                          return r, "Página oficial del Banco Central de Costa Rica"
+                  except Exception as e:
+                      print("Página principal BCCR con navegador falló:", e)
+
+                  browser.close()
+              return None
 
           print("=" * 70)
           print("ACTUALIZACIÓN DEL TIPO DE CAMBIO BCCR")
-          print(f"Fecha/hora Costa Rica: {actualizado}")
-          print(f"Periodo WS: {inicio} a {final}")
+          print("Fecha/hora Costa Rica:", actualizado)
+          print("Periodo:", inicio, "a", final)
           print("=" * 70)
 
-          compras_ws = consultar_ws("317")
-          ventas_ws = consultar_ws("318")
-          comunes = sorted(set(compras_ws) & set(ventas_ws), reverse=True)
+          compras = consultar_ws("317")
+          ventas = consultar_ws("318")
+          comunes = sorted(set(compras) & set(ventas), reverse=True)
 
           if comunes:
               fecha = comunes[0]
-              compra = compras_ws[fecha]
-              venta = ventas_ws[fecha]
+              compra = compras[fecha]
+              venta = ventas[fecha]
               fuente = "Web Service del Banco Central de Costa Rica"
-              print(
-                  f"Web Service OK: {fecha.strftime('%d/%m/%Y')} "
-                  f"compra={compra}, venta={venta}"
-              )
           else:
-              print("Web Service no disponible o sin datos comunes; usando respaldo oficial.")
-              respaldo = consultar_cuadro_oficial()
+              respaldo = consultar_con_navegador()
               if not respaldo:
-                  print("ERROR: no fue posible obtener el tipo de cambio desde ninguna fuente oficial.")
-                  print("Se conserva el último tipocambio.json válido.")
+                  print("ERROR: no fue posible obtener datos válidos desde las fuentes oficiales del BCCR.")
                   sys.exit(1)
-
-              fecha, compra, venta = respaldo
-              fuente = "Cuadro 400 de Indicadores Económicos del Banco Central de Costa Rica"
+              (fecha, compra, venta), fuente = respaldo
 
           salida = {
               "compra": compra,
@@ -339,10 +301,8 @@ jobs:
               json.dump(salida, f, ensure_ascii=False, indent=2)
               f.write("\n")
 
-          print("=" * 70)
-          print("tipocambio.json generado correctamente")
+          print("tipocambio.json generado:")
           print(json.dumps(salida, ensure_ascii=False, indent=2))
-          print("=" * 70)
           PY
 
       - name: Guardar cambios
