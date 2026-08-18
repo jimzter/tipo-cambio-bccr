@@ -52,7 +52,7 @@ jobs:
           import sys
           import time
           from datetime import datetime, timedelta
-          from urllib.error import HTTPError, URLError
+          from urllib.error import HTTPError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
@@ -73,13 +73,10 @@ jobs:
           WS_BASE = "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/wsindicadoreseconomicos.asmx"
           WS_XML = WS_BASE + "/ObtenerIndicadoresEconomicosXML"
           WS_DATASET = WS_BASE + "/ObtenerIndicadoresEconomicos"
-          CUADRO_URL = (
-              "https://gee.bccr.fi.cr/indicadoreseconomicos/Cuadros/frmVerCatCuadro.aspx"
-              "?CodCuadro=400&FecInicial=" + inicio_dt.strftime("%Y/%m/%d") +
-              "&FecFinal=" + ahora.strftime("%Y/%m/%d") +
-              "&Filtro=0&Idioma=1"
-          )
-          HOME_URL = "https://www.bccr.fi.cr/"
+
+          # Nuevas páginas oficiales enlazadas desde www.bccr.fi.cr
+          SDD_COMPRA = "https://sdd.bccr.fi.cr/es/IndicadoresEconomicos/Inicio/Contenedor/124?Cuadro=488"
+          SDD_VENTA = "https://sdd.bccr.fi.cr/es/IndicadoresEconomicos/Inicio/Contenedor/125?Cuadro=491"
 
           def valor_numero(texto):
               t = texto.strip().replace("\xa0", "").replace("₡", "").replace("CRC", "")
@@ -93,17 +90,30 @@ jobs:
                       t = t.replace(",", "")
               return round(float(t), 2)
 
+          MESES = {
+              "ene":1,"enero":1,"feb":2,"febrero":2,"mar":3,"marzo":3,
+              "abr":4,"abril":4,"may":5,"mayo":5,"jun":6,"junio":6,
+              "jul":7,"julio":7,"ago":8,"agosto":8,"sep":9,"set":9,
+              "septiembre":9,"setiembre":9,"oct":10,"octubre":10,
+              "nov":11,"noviembre":11,"dic":12,"diciembre":12,
+          }
+
           def parse_fecha(texto):
+              texto = texto.strip()
               m = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
               if m:
                   return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-              m = re.search(r"(\d{1,2})\s+(Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Set|Oct|Nov|Dic)\s+(\d{4})", texto, re.I)
+              m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", texto)
               if m:
-                  meses = {"ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,"jul":7,"ago":8,"sep":9,"set":9,"oct":10,"nov":11,"dic":12}
-                  return datetime(int(m.group(3)), meses[m.group(2).lower()], int(m.group(1))).date()
-              m = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
+                  return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))).date()
+              m = re.search(
+                  r"(\d{1,2})\s+(Ene(?:ro)?|Feb(?:rero)?|Mar(?:zo)?|Abr(?:il)?|May(?:o)?|Jun(?:io)?|Jul(?:io)?|Ago(?:sto)?|Sep(?:tiembre)?|Set(?:iembre)?|Oct(?:ubre)?|Nov(?:iembre)?|Dic(?:iembre)?)\s+(\d{4})",
+                  texto, re.I
+              )
               if m:
-                  return datetime.strptime(m.group(1), "%d/%m/%Y").date()
+                  mes = MESES.get(m.group(2).lower())
+                  if mes:
+                      return datetime(int(m.group(3)), mes, int(m.group(1))).date()
               return None
 
           def extraer_registros_xml(raw):
@@ -121,8 +131,9 @@ jobs:
               for f, v in zip(fechas, valores):
                   try:
                       fecha = parse_fecha(f)
-                      if fecha:
-                          registros[fecha] = valor_numero(v)
+                      valor = valor_numero(v)
+                      if fecha and 300 <= valor <= 800:
+                          registros[fecha] = valor
                   except Exception:
                       pass
               return registros
@@ -158,7 +169,6 @@ jobs:
               }
               data = urlencode(params).encode("utf-8")
 
-              # 1) XML por POST
               for intento, espera in enumerate((0, 5, 15), 1):
                   if espera:
                       time.sleep(espera)
@@ -173,10 +183,8 @@ jobs:
                   except Exception as e:
                       print(f"WS XML {indicador}: {e}")
 
-              # 2) DataSet por GET como alternativa oficial
               try:
-                  url = WS_DATASET + "?" + urlencode(params)
-                  raw = pedir(url)
+                  raw = pedir(WS_DATASET + "?" + urlencode(params))
                   regs = extraer_registros_xml(raw)
                   if regs:
                       print(f"WS DataSet {indicador}: {len(regs)} registros.")
@@ -186,86 +194,94 @@ jobs:
 
               return {}
 
-          def extraer_cuadro_texto(texto):
+          def extraer_serie_sdd(texto, etiqueta):
               lineas = [re.sub(r"\s+", " ", x).strip() for x in texto.splitlines() if x.strip()]
-              fechas = []
-              numeros = []
+              registros = {}
+
+              # Caso 1: fecha y valor están en la misma línea.
               for linea in lineas:
-                  f = parse_fecha(linea)
-                  if f:
-                      fechas.append(f)
+                  fecha = parse_fecha(linea)
+                  if not fecha:
                       continue
-                  if re.fullmatch(r"\d{3}[,.]\d{2,5}", linea):
+                  nums = re.findall(r"(?<!\d)(\d{3}[,.]\d{2,5})(?!\d)", linea)
+                  for num in nums:
                       try:
-                          numeros.append(valor_numero(linea))
+                          valor = valor_numero(num)
+                          if 300 <= valor <= 800:
+                              registros[fecha] = valor
+                              break
                       except Exception:
                           pass
-              if not fechas or len(numeros) < len(fechas) * 2:
-                  return None
-              n = len(fechas)
-              compras = numeros[:n]
-              ventas = numeros[n:n*2]
-              candidatos = [(f, compras[i], ventas[i]) for i, f in enumerate(fechas) if f <= ahora.date()]
-              if not candidatos:
-                  return None
-              f, compra, venta = max(candidatos, key=lambda x: x[0])
-              if 300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra:
-                  return f, compra, venta
-              return None
 
-          def extraer_home_texto(texto):
-              limpio = re.sub(r"\s+", " ", texto)
-              mc = re.search(r"Compra\s+USD\s*₡?\s*([0-9]{3}[,.][0-9]{2})", limpio, re.I)
-              mv = re.search(r"Venta\s+USD\s*₡?\s*([0-9]{3}[,.][0-9]{2})", limpio, re.I)
-              if not mc or not mv:
-                  mc = re.search(r"\bCompra\b.{0,80}?([0-9]{3}[,.][0-9]{2})", limpio, re.I)
-                  mv = re.search(r"\bVenta\b.{0,80}?([0-9]{3}[,.][0-9]{2})", limpio, re.I)
-              if not mc or not mv:
-                  return None
-              compra = valor_numero(mc.group(1))
-              venta = valor_numero(mv.group(1))
-              if 300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra:
-                  return ahora.date(), compra, venta
-              return None
+              # Caso 2: tabla con fecha en una línea y valor en líneas cercanas.
+              for i, linea in enumerate(lineas):
+                  fecha = parse_fecha(linea)
+                  if not fecha or fecha in registros:
+                      continue
+                  for prox in lineas[i + 1:i + 9]:
+                      nums = re.findall(r"(?<!\d)(\d{3}[,.]\d{2,5})(?!\d)", prox)
+                      encontrado = False
+                      for num in nums:
+                          try:
+                              valor = valor_numero(num)
+                              if 300 <= valor <= 800:
+                                  registros[fecha] = valor
+                                  encontrado = True
+                                  break
+                          except Exception:
+                              pass
+                      if encontrado or parse_fecha(prox):
+                          break
 
-          def consultar_con_navegador():
-              print("Intentando respaldo oficial con navegador Chromium...")
+              print(f"SDD {etiqueta}: {len(registros)} registro(s) detectado(s).")
+              if not registros:
+                  print(f"SDD {etiqueta}: primeras líneas visibles:")
+                  for x in lineas[:40]:
+                      print("  ", x[:250])
+              return registros
+
+          def consultar_sdd_con_navegador():
+              print("Intentando respaldo oficial en la nueva plataforma SDD del BCCR...")
               with sync_playwright() as p:
                   browser = p.chromium.launch(headless=True)
-                  page = browser.new_page(locale="es-CR")
+                  context = browser.new_context(locale="es-CR")
+                  page = context.new_page()
 
-                  # Cuadro 400
-                  try:
-                      print("Abriendo Cuadro 400:", CUADRO_URL)
-                      page.goto(CUADRO_URL, wait_until="domcontentloaded", timeout=60000)
-                      page.wait_for_timeout(3000)
-                      texto = page.locator("body").inner_text(timeout=10000)
-                      print("Cuadro 400: caracteres visibles:", len(texto))
-                      r = extraer_cuadro_texto(texto)
-                      if r:
-                          browser.close()
-                          print("Cuadro 400 OK:", r)
-                          return r, "Cuadro 400 del Banco Central de Costa Rica"
-                  except Exception as e:
-                      print("Cuadro 400 con navegador falló:", e)
+                  def abrir(url, etiqueta):
+                      print(f"Abriendo SDD {etiqueta}: {url}")
+                      try:
+                          resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                          print(f"SDD {etiqueta}: HTTP", resp.status if resp else "sin respuesta")
+                          try:
+                              page.wait_for_load_state("networkidle", timeout=20000)
+                          except Exception:
+                              pass
+                          page.wait_for_timeout(5000)
+                          texto = page.locator("body").inner_text(timeout=15000)
+                          print(f"SDD {etiqueta}: {len(texto)} caracteres visibles.")
+                          return extraer_serie_sdd(texto, etiqueta)
+                      except Exception as e:
+                          print(f"SDD {etiqueta}: error al abrir/leer: {e}")
+                          return {}
 
-                  # Página principal oficial
-                  try:
-                      print("Abriendo página principal BCCR:", HOME_URL)
-                      page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-                      page.wait_for_timeout(5000)
-                      texto = page.locator("body").inner_text(timeout=10000)
-                      print("Página principal: caracteres visibles:", len(texto))
-                      r = extraer_home_texto(texto)
-                      if r:
-                          browser.close()
-                          print("Página principal BCCR OK:", r)
-                          return r, "Página oficial del Banco Central de Costa Rica"
-                  except Exception as e:
-                      print("Página principal BCCR con navegador falló:", e)
-
+                  compras = abrir(SDD_COMPRA, "compra")
+                  ventas = abrir(SDD_VENTA, "venta")
                   browser.close()
-              return None
+
+              comunes = sorted(set(compras) & set(ventas), reverse=True)
+              if not comunes:
+                  print("SDD: no se encontraron fechas comunes entre compra y venta.")
+                  return None
+
+              fecha = comunes[0]
+              compra = compras[fecha]
+              venta = ventas[fecha]
+              if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
+                  print(f"SDD: valores inválidos: {fecha=} {compra=} {venta=}")
+                  return None
+
+              print(f"SDD OK: {fecha.strftime('%d/%m/%Y')} compra={compra} venta={venta}")
+              return fecha, compra, venta
 
           print("=" * 70)
           print("ACTUALIZACIÓN DEL TIPO DE CAMBIO BCCR")
@@ -283,11 +299,12 @@ jobs:
               venta = ventas[fecha]
               fuente = "Web Service del Banco Central de Costa Rica"
           else:
-              respaldo = consultar_con_navegador()
+              respaldo = consultar_sdd_con_navegador()
               if not respaldo:
                   print("ERROR: no fue posible obtener datos válidos desde las fuentes oficiales del BCCR.")
                   sys.exit(1)
-              (fecha, compra, venta), fuente = respaldo
+              fecha, compra, venta = respaldo
+              fuente = "Plataforma SDD de Indicadores Económicos del Banco Central de Costa Rica"
 
           salida = {
               "compra": compra,
