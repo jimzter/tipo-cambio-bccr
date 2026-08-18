@@ -46,40 +46,56 @@ jobs:
           import sys
           import time
           from datetime import datetime, timedelta
+          from html.parser import HTMLParser
           from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode
           from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
 
-          token = os.environ.get("BCCR_TOKEN", "").strip()
-          nombre = os.environ.get("BCCR_NOMBRE", "").strip()
-          correo = os.environ.get("BCCR_CORREO", "").strip()
-
-          zona = ZoneInfo("America/Costa_Rica")
-          ahora = datetime.now(zona)
+          ZONA = ZoneInfo("America/Costa_Rica")
+          ahora = datetime.now(ZONA)
           inicio = (ahora - timedelta(days=10)).strftime("%d/%m/%Y")
           final = ahora.strftime("%d/%m/%Y")
           actualizado = ahora.strftime("%d/%m/%Y %H:%M:%S")
 
-          endpoint = (
+          token = os.environ.get("BCCR_TOKEN", "").strip()
+          nombre = os.environ.get("BCCR_NOMBRE", "").strip()
+          correo = os.environ.get("BCCR_CORREO", "").strip()
+
+          WS_URL = (
               "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/"
               "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
           )
-          pagina_oficial = "https://www.bccr.fi.cr/SitePages/Inicio.aspx"
+
+          # Cuadro público oficial del BCCR con compra y venta de referencia.
+          CUADRO_URL = (
+              "https://gee.bccr.fi.cr/indicadoreseconomicos/Cuadros/"
+              "frmVerCatCuadro.aspx?CodCuadro=400&Idioma=1"
+          )
+
+          class TextExtractor(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.partes = []
+
+              def handle_data(self, data):
+                  data = data.strip()
+                  if data:
+                      self.partes.append(data)
 
           def valor_numero(texto):
-              texto = texto.strip().replace("\xa0", "").replace("₡", "").replace("CRC", "")
-              texto = texto.replace(" ", "")
-              if "," in texto and "." not in texto:
-                  texto = texto.replace(",", ".")
-              elif "," in texto and "." in texto:
-                  if texto.rfind(",") > texto.rfind("."):
-                      texto = texto.replace(".", "").replace(",", ".")
+              t = texto.strip().replace("\xa0", "").replace("₡", "")
+              t = t.replace("CRC", "").replace(" ", "")
+              if "," in t and "." not in t:
+                  t = t.replace(",", ".")
+              elif "," in t and "." in t:
+                  if t.rfind(",") > t.rfind("."):
+                      t = t.replace(".", "").replace(",", ".")
                   else:
-                      texto = texto.replace(",", "")
-              return round(float(texto), 2)
+                      t = t.replace(",", "")
+              return round(float(t), 2)
 
-          def fecha_valida(texto):
+          def fecha_ws(texto):
               texto = texto.strip()
               m = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
               if m:
@@ -89,10 +105,32 @@ jobs:
                   return datetime.strptime(m.group(1), "%d/%m/%Y").date()
               raise ValueError(f"Fecha no reconocida: {texto}")
 
+          def request(url, data=None, timeout=60):
+              req = Request(
+                  url,
+                  data=data,
+                  method="POST" if data is not None else "GET",
+                  headers={
+                      "User-Agent": (
+                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/127.0 Safari/537.36"
+                      ),
+                      "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*",
+                      "Accept-Language": "es-CR,es;q=0.9,en;q=0.5",
+                      "Cache-Control": "no-cache",
+                      "Content-Type": "application/x-www-form-urlencoded" if data else "text/html",
+                  },
+              )
+              with urlopen(req, timeout=timeout) as r:
+                  raw = r.read().decode("utf-8", errors="ignore")
+                  print(f"HTTP {getattr(r, 'status', 200)} - {url} - {len(raw)} bytes")
+                  return raw
+
           def consultar_ws(indicador):
               if not token:
-                  print("BCCR_TOKEN no está configurado; se intentará la fuente oficial de respaldo.")
-                  return None
+                  print("BCCR_TOKEN no está configurado; se omite Web Service.")
+                  return {}
 
               datos = urlencode({
                   "Indicador": indicador,
@@ -104,47 +142,22 @@ jobs:
                   "Token": token,
               }).encode("utf-8")
 
-              for intento, espera in enumerate((0, 5, 15, 30), 1):
+              raw = None
+              for intento, espera in enumerate((0, 5, 15), 1):
                   if espera:
-                      print(f"Reintento {intento} en {espera}s para {indicador}...")
+                      print(f"Reintento WS {indicador} en {espera}s...")
                       time.sleep(espera)
-
-                  req = Request(
-                      endpoint,
-                      data=datos,
-                      method="POST",
-                      headers={
-                          "User-Agent": "GitHub-Actions-Tipo-Cambio-BCCR/4.0",
-                          "Accept": "application/xml,text/xml,*/*",
-                          "Content-Type": "application/x-www-form-urlencoded",
-                      },
-                  )
-
                   try:
-                      with urlopen(req, timeout=60) as r:
-                          raw = r.read().decode("utf-8", errors="ignore")
-                          print(f"WS {indicador}: HTTP {getattr(r, 'status', 200)}, {len(raw)} bytes recibidos.")
-                          return raw
+                      raw = request(WS_URL, datos)
+                      break
                   except HTTPError as e:
-                      cuerpo = ""
-                      try:
-                          cuerpo = e.read().decode("utf-8", errors="ignore")[:300]
-                      except Exception:
-                          pass
-                      print(f"HTTP {e.code}: indicador {indicador}, intento {intento}. Respuesta: {cuerpo!r}")
+                      print(f"WS {indicador}: HTTP {e.code}, intento {intento}")
                       if e.code not in (429, 500, 502, 503, 504):
-                          return None
+                          break
                   except (URLError, TimeoutError) as e:
-                      print(f"Conexión fallida para {indicador}, intento {intento}: {e}")
-                  except Exception as e:
-                      print(f"Error inesperado para {indicador}: {e}")
-                      return None
+                      print(f"WS {indicador}: error de conexión, intento {intento}: {e}")
 
-              return None
-
-          def extraer_ws(raw, indicador):
               if not raw:
-                  print(f"Indicador {indicador}: sin respuesta utilizable.")
                   return {}
 
               data = raw
@@ -166,158 +179,152 @@ jobs:
               registros = {}
               for f, v in zip(fechas, valores):
                   try:
-                      registros[fecha_valida(f)] = valor_numero(v)
-                  except (ValueError, TypeError) as e:
-                      print(f"Registro descartado en indicador {indicador}: fecha={f!r}, valor={v!r}, error={e}")
+                      registros[fecha_ws(f)] = valor_numero(v)
+                  except Exception as e:
+                      print(f"WS {indicador}: registro descartado {f!r}/{v!r}: {e}")
 
-              print(
-                  f"Indicador {indicador}: {len(registros)} registro(s) válido(s), "
-                  f"{len(fechas)} fecha(s), {len(valores)} valor(es)."
-              )
+              print(f"WS {indicador}: {len(registros)} registro(s) válido(s).")
               return registros
 
-          def extraer_valor_etiqueta(texto, etiqueta):
-              patrones = [
-                  rf"\b{etiqueta}\b\s*(?:USD\s*)?(?:CRC\s*)?(?:₡\s*)?([0-9]{{3}}(?:[.,][0-9]{{2}}))",
-                  rf"\b{etiqueta}\b.{{0,120}}?(?:USD\s*)?(?:CRC\s*)?(?:₡\s*)?([0-9]{{3}}(?:[.,][0-9]{{2}}))",
-              ]
-              for patron in patrones:
-                  m = re.search(patron, texto, re.I | re.S)
-                  if m:
-                      try:
-                          return valor_numero(m.group(1))
-                      except ValueError:
-                          pass
-              return None
+          MESES = {
+              "ene": 1, "feb": 2, "mar": 3, "abr": 4,
+              "may": 5, "jun": 6, "jul": 7, "ago": 8,
+              "sep": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12,
+          }
 
-          def consultar_pagina_oficial():
-              print("Intentando fuente oficial alternativa: página principal del BCCR...")
+          def parse_fecha_cuadro(texto):
+              m = re.fullmatch(
+                  r"(\d{1,2})\s+(Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Set|Oct|Nov|Dic)\s+(\d{4})",
+                  texto.strip(), re.I
+              )
+              if not m:
+                  return None
+              return datetime(
+                  int(m.group(3)), MESES[m.group(2).lower()], int(m.group(1))
+              ).date()
 
+          def consultar_cuadro_oficial():
+              print("Intentando respaldo: cuadro público oficial BCCR (CodCuadro=400)...")
+
+              raw = None
               for intento, espera in enumerate((0, 5, 15), 1):
                   if espera:
-                      print(f"Reintento página oficial en {espera}s...")
+                      print(f"Reintento cuadro oficial en {espera}s...")
                       time.sleep(espera)
-
-                  req = Request(
-                      pagina_oficial,
-                      headers={
-                          "User-Agent": (
-                              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/127.0 Safari/537.36"
-                          ),
-                          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                          "Accept-Language": "es-CR,es;q=0.9,en;q=0.5",
-                          "Cache-Control": "no-cache",
-                      },
-                  )
-
                   try:
-                      with urlopen(req, timeout=60) as r:
-                          raw = r.read().decode("utf-8", errors="ignore")
-                          print(f"Página oficial: HTTP {getattr(r, 'status', 200)}, {len(raw)} bytes recibidos.")
-
-                      texto = html.unescape(raw)
-                      texto = re.sub(r"<script\b[^>]*>.*?</script>", " ", texto, flags=re.I | re.S)
-                      texto = re.sub(r"<style\b[^>]*>.*?</style>", " ", texto, flags=re.I | re.S)
-                      texto = re.sub(r"<[^>]+>", " ", texto)
-                      texto = texto.replace("\xa0", " ")
-                      texto = re.sub(r"\s+", " ", texto).strip()
-
-                      seccion = texto
-                      candidatos = [
-                          r"TIPO\s+DE\s+CAMBIO\s+DE\s+REFERENCIA",
-                          r"TIPO\s+DE\s+CAMBIO",
-                      ]
-                      for patron in candidatos:
-                          inicio_sec = re.search(patron, texto, re.I)
-                          if inicio_sec:
-                              seccion = texto[inicio_sec.start():inicio_sec.start() + 3000]
-                              break
-
-                      compra = extraer_valor_etiqueta(seccion, "Compra")
-                      venta = extraer_valor_etiqueta(seccion, "Venta")
-
-                      if compra is None or venta is None:
-                          compra = compra if compra is not None else extraer_valor_etiqueta(texto, "Compra")
-                          venta = venta if venta is not None else extraer_valor_etiqueta(texto, "Venta")
-
-                      if compra is None or venta is None:
-                          print(
-                              f"Intento {intento}: no se localizaron compra y venta. "
-                              f"Compra={compra}, Venta={venta}."
-                          )
-                          continue
-
-                      if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
-                          print(
-                              f"Intento {intento}: valores fuera de rango esperado: "
-                              f"compra={compra}, venta={venta}."
-                          )
-                          continue
-
-                      print(
-                          "Fuente oficial alternativa consultada correctamente: "
-                          f"compra={compra}, venta={venta}."
-                      )
-                      return compra, venta
-
+                      raw = request(CUADRO_URL)
+                      break
                   except HTTPError as e:
-                      print(f"Página oficial BCCR: HTTP {e.code}, intento {intento}")
+                      print(f"Cuadro oficial: HTTP {e.code}, intento {intento}")
                   except (URLError, TimeoutError) as e:
-                      print(f"Página oficial BCCR: error de conexión, intento {intento}: {e}")
-                  except Exception as e:
-                      print(f"Página oficial BCCR: error inesperado, intento {intento}: {e}")
+                      print(f"Cuadro oficial: error de conexión, intento {intento}: {e}")
 
-              return None
+              if not raw:
+                  return None
+
+              parser = TextExtractor()
+              parser.feed(html.unescape(raw))
+              tokens = [re.sub(r"\s+", " ", x).strip() for x in parser.partes]
+
+              # Trabajar solo entre el encabezado del cuadro y la fuente.
+              inicio_idx = 0
+              fin_idx = len(tokens)
+              for i, t in enumerate(tokens):
+                  if "TIPO CAMBIO COMPRA" in t.upper():
+                      inicio_idx = i
+                      break
+              for i in range(inicio_idx, len(tokens)):
+                  if tokens[i].upper().startswith("FUENTE"):
+                      fin_idx = i
+                      break
+
+              zona = tokens[inicio_idx:fin_idx]
+              fechas = []
+              numeros = []
+
+              for t in zona:
+                  f = parse_fecha_cuadro(t)
+                  if f:
+                      fechas.append(f)
+                      continue
+
+                  # El cuadro usa valores como 446,12000 / 451,89000.
+                  if re.fullmatch(r"\d{3}[,.]\d{2,5}", t):
+                      try:
+                          numeros.append(valor_numero(t))
+                      except ValueError:
+                          pass
+
+              print(
+                  f"Cuadro oficial: {len(fechas)} fecha(s) y "
+                  f"{len(numeros)} valor(es) detectados."
+              )
+
+              if not fechas or len(numeros) < len(fechas) * 2:
+                  print("Cuadro oficial: estructura inesperada; no se puede validar compra/venta.")
+                  return None
+
+              n = len(fechas)
+              compras = numeros[:n]
+              ventas = numeros[n:n * 2]
+
+              candidatos = [
+                  (f, compras[i], ventas[i])
+                  for i, f in enumerate(fechas)
+                  if f <= ahora.date()
+              ]
+              if not candidatos:
+                  return None
+
+              f, compra, venta = max(candidatos, key=lambda x: x[0])
+
+              if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
+                  print(
+                      "Cuadro oficial: valores fuera de rango: "
+                      f"fecha={f}, compra={compra}, venta={venta}"
+                  )
+                  return None
+
+              print(
+                  "Cuadro oficial OK: "
+                  f"fecha={f.strftime('%d/%m/%Y')}, compra={compra}, venta={venta}"
+              )
+              return f, compra, venta
 
           print("=" * 70)
           print("ACTUALIZACIÓN DEL TIPO DE CAMBIO BCCR")
           print(f"Fecha/hora Costa Rica: {actualizado}")
-          print(f"Periodo consultado: {inicio} a {final}")
+          print(f"Periodo WS: {inicio} a {final}")
           print("=" * 70)
 
-          compras = extraer_ws(consultar_ws("317"), "317")
-          ventas = extraer_ws(consultar_ws("318"), "318")
-
-          comunes = sorted(set(compras) & set(ventas), reverse=True)
-          fuente = "Web Service del Banco Central de Costa Rica"
+          compras_ws = consultar_ws("317")
+          ventas_ws = consultar_ws("318")
+          comunes = sorted(set(compras_ws) & set(ventas_ws), reverse=True)
 
           if comunes:
               fecha = comunes[0]
-              compra = compras[fecha]
-              venta = ventas[fecha]
-              fecha_texto = fecha.strftime("%d/%m/%Y")
+              compra = compras_ws[fecha]
+              venta = ventas_ws[fecha]
+              fuente = "Web Service del Banco Central de Costa Rica"
               print(
-                  f"Web Service OK: fecha={fecha_texto}, "
-                  f"compra={compra}, venta={venta}."
+                  f"Web Service OK: {fecha.strftime('%d/%m/%Y')} "
+                  f"compra={compra}, venta={venta}"
               )
           else:
-              print(
-                  "El Web Service no devolvió datos comunes válidos para compra y venta. "
-                  "Se activará la fuente oficial de respaldo."
-              )
-              respaldo = consultar_pagina_oficial()
-
+              print("Web Service no disponible o sin datos comunes; usando respaldo oficial.")
+              respaldo = consultar_cuadro_oficial()
               if not respaldo:
-                  print(
-                      "ERROR: no fue posible obtener valores ni desde el Web Service "
-                      "ni desde la página oficial del BCCR."
-                  )
-                  print(
-                      "Se conserva el último tipocambio.json válido, pero el workflow "
-                      "se marcará como fallido para que el problema sea visible."
-                  )
+                  print("ERROR: no fue posible obtener el tipo de cambio desde ninguna fuente oficial.")
+                  print("Se conserva el último tipocambio.json válido.")
                   sys.exit(1)
 
-              compra, venta = respaldo
-              fecha_texto = ahora.strftime("%d/%m/%Y")
-              fuente = "Página oficial del Banco Central de Costa Rica"
+              fecha, compra, venta = respaldo
+              fuente = "Cuadro público de Indicadores Económicos del Banco Central de Costa Rica"
 
           salida = {
               "compra": compra,
               "venta": venta,
-              "fecha": fecha_texto,
+              "fecha": fecha.strftime("%d/%m/%Y"),
               "actualizado": actualizado,
               "fuente": fuente,
           }
@@ -327,12 +334,8 @@ jobs:
               f.write("\n")
 
           print("=" * 70)
-          print("tipocambio.json generado correctamente.")
-          print("Compra:", salida["compra"])
-          print("Venta:", salida["venta"])
-          print("Fecha:", salida["fecha"])
-          print("Actualizado:", salida["actualizado"])
-          print("Fuente utilizada:", salida["fuente"])
+          print("tipocambio.json generado correctamente")
+          print(json.dumps(salida, ensure_ascii=False, indent=2))
           print("=" * 70)
           PY
 
