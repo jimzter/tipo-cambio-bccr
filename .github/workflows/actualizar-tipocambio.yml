@@ -54,7 +54,8 @@ jobs:
 
           ZONA = ZoneInfo("America/Costa_Rica")
           ahora = datetime.now(ZONA)
-          inicio = (ahora - timedelta(days=10)).strftime("%d/%m/%Y")
+          desde = ahora - timedelta(days=10)
+          inicio = desde.strftime("%d/%m/%Y")
           final = ahora.strftime("%d/%m/%Y")
           actualizado = ahora.strftime("%d/%m/%Y %H:%M:%S")
 
@@ -67,10 +68,16 @@ jobs:
               "wsindicadoreseconomicos.asmx/ObtenerIndicadoresEconomicosXML"
           )
 
-          # Cuadro público oficial del BCCR con compra y venta de referencia.
+          cuadro_params = urlencode({
+              "CodCuadro": "400",
+              "FecInicial": desde.strftime("%Y/%m/%d"),
+              "FecFinal": ahora.strftime("%Y/%m/%d"),
+              "Filtro": "0",
+              "Idioma": "1",
+          })
           CUADRO_URL = (
               "https://gee.bccr.fi.cr/indicadoreseconomicos/Cuadros/"
-              "frmVerCatCuadro.aspx?CodCuadro=400&Idioma=1"
+              f"frmVerCatCuadro.aspx?{cuadro_params}"
           )
 
           class TextExtractor(HTMLParser):
@@ -124,7 +131,7 @@ jobs:
               )
               with urlopen(req, timeout=timeout) as r:
                   raw = r.read().decode("utf-8", errors="ignore")
-                  print(f"HTTP {getattr(r, 'status', 200)} - {url} - {len(raw)} bytes")
+                  print(f"HTTP {getattr(r, 'status', 200)} - {len(raw)} bytes")
                   return raw
 
           def consultar_ws(indicador):
@@ -204,7 +211,8 @@ jobs:
               ).date()
 
           def consultar_cuadro_oficial():
-              print("Intentando respaldo: cuadro público oficial BCCR (CodCuadro=400)...")
+              print("Intentando respaldo: Cuadro 400 oficial del BCCR con rango de fechas...")
+              print(f"Rango cuadro: {desde.strftime('%Y/%m/%d')} a {ahora.strftime('%Y/%m/%d')}")
 
               raw = None
               for intento, espera in enumerate((0, 5, 15), 1):
@@ -226,7 +234,6 @@ jobs:
               parser.feed(html.unescape(raw))
               tokens = [re.sub(r"\s+", " ", x).strip() for x in parser.partes]
 
-              # Trabajar solo entre el encabezado del cuadro y la fuente.
               inicio_idx = 0
               fin_idx = len(tokens)
               for i, t in enumerate(tokens):
@@ -247,8 +254,6 @@ jobs:
                   if f:
                       fechas.append(f)
                       continue
-
-                  # El cuadro usa valores como 446,12000 / 451,89000.
                   if re.fullmatch(r"\d{3}[,.]\d{2,5}", t):
                       try:
                           numeros.append(valor_numero(t))
@@ -261,7 +266,8 @@ jobs:
               )
 
               if not fechas or len(numeros) < len(fechas) * 2:
-                  print("Cuadro oficial: estructura inesperada; no se puede validar compra/venta.")
+                  print("Cuadro oficial: estructura inesperada.")
+                  print("Primeros tokens detectados:", tokens[:40])
                   return None
 
               n = len(fechas)
@@ -319,7 +325,7 @@ jobs:
                   sys.exit(1)
 
               fecha, compra, venta = respaldo
-              fuente = "Cuadro público de Indicadores Económicos del Banco Central de Costa Rica"
+              fuente = "Cuadro 400 de Indicadores Económicos del Banco Central de Costa Rica"
 
           salida = {
               "compra": compra,
