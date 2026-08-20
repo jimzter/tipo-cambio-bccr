@@ -38,280 +38,236 @@ jobs:
           pip install playwright
           python -m playwright install chromium
 
-      - name: Consultar BCCR y generar JSON
-        env:
-          BCCR_TOKEN: ${{ secrets.BCCR_TOKEN }}
-          BCCR_NOMBRE: jimmy
-          BCCR_CORREO: jtellezsandoval@gmail.com
+      - name: Consultar cuadro oficial unificado del BCCR
         run: |
           python - << 'PY'
-          import html
           import json
-          import os
           import re
           import sys
-          import time
-          from datetime import datetime, timedelta
-          from urllib.error import HTTPError
-          from urllib.parse import urlencode
-          from urllib.request import Request, urlopen
+          from datetime import datetime
           from zoneinfo import ZoneInfo
 
           from playwright.sync_api import sync_playwright
 
-          zona = ZoneInfo("America/Costa_Rica")
-          ahora = datetime.now(zona)
-          inicio_dt = ahora - timedelta(days=10)
-          inicio = inicio_dt.strftime("%d/%m/%Y")
-          final = ahora.strftime("%d/%m/%Y")
-          actualizado = ahora.strftime("%d/%m/%Y %H:%M:%S")
+          ZONA = ZoneInfo("America/Costa_Rica")
+          AHORA = datetime.now(ZONA)
+          HOY = AHORA.date()
+          ACTUALIZADO = AHORA.strftime("%d/%m/%Y %H:%M:%S")
 
-          token = os.environ.get("BCCR_TOKEN", "").strip()
-          nombre = os.environ.get("BCCR_NOMBRE", "").strip()
-          correo = os.environ.get("BCCR_CORREO", "").strip()
-
-          WS_BASE = "https://gee.bccr.fi.cr/Indicadores/Suscripciones/WS/wsindicadoreseconomicos.asmx"
-          WS_XML = WS_BASE + "/ObtenerIndicadoresEconomicosXML"
-          WS_DATASET = WS_BASE + "/ObtenerIndicadoresEconomicos"
-
-          # Nuevas páginas oficiales enlazadas desde www.bccr.fi.cr
-          SDD_COMPRA = "https://sdd.bccr.fi.cr/es/IndicadoresEconomicos/Inicio/Contenedor/124?Cuadro=488"
-          SDD_VENTA = "https://sdd.bccr.fi.cr/es/IndicadoresEconomicos/Inicio/Contenedor/125?Cuadro=491"
-
-          def valor_numero(texto):
-              t = texto.strip().replace("\xa0", "").replace("₡", "").replace("CRC", "")
-              t = t.replace(" ", "")
-              if "," in t and "." not in t:
-                  t = t.replace(",", ".")
-              elif "," in t and "." in t:
-                  if t.rfind(",") > t.rfind("."):
-                      t = t.replace(".", "").replace(",", ".")
-                  else:
-                      t = t.replace(",", "")
-              return round(float(t), 2)
+          URL = "https://sdd.bccr.fi.cr/es/IndicadoresEconomicos/Inicio/Contenedor/6?Cuadro=1"
 
           MESES = {
-              "ene":1,"enero":1,"feb":2,"febrero":2,"mar":3,"marzo":3,
-              "abr":4,"abril":4,"may":5,"mayo":5,"jun":6,"junio":6,
-              "jul":7,"julio":7,"ago":8,"agosto":8,"sep":9,"set":9,
-              "septiembre":9,"setiembre":9,"oct":10,"octubre":10,
-              "nov":11,"noviembre":11,"dic":12,"diciembre":12,
+              "ene": 1, "enero": 1,
+              "feb": 2, "febrero": 2,
+              "mar": 3, "marzo": 3,
+              "abr": 4, "abril": 4,
+              "may": 5, "mayo": 5,
+              "jun": 6, "junio": 6,
+              "jul": 7, "julio": 7,
+              "ago": 8, "agosto": 8,
+              "sep": 9, "sept": 9, "set": 9,
+              "septiembre": 9, "setiembre": 9,
+              "oct": 10, "octubre": 10,
+              "nov": 11, "noviembre": 11,
+              "dic": 12, "diciembre": 12,
           }
 
           def parse_fecha(texto):
-              texto = texto.strip()
-              m = re.search(r"(\d{4}-\d{2}-\d{2})", texto)
-              if m:
-                  return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-              m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", texto)
+              t = re.sub(r"\s+", " ", texto.strip())
+
+              m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", t)
               if m:
                   return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))).date()
+
               m = re.search(
-                  r"(\d{1,2})\s+(Ene(?:ro)?|Feb(?:rero)?|Mar(?:zo)?|Abr(?:il)?|May(?:o)?|Jun(?:io)?|Jul(?:io)?|Ago(?:sto)?|Sep(?:tiembre)?|Set(?:iembre)?|Oct(?:ubre)?|Nov(?:iembre)?|Dic(?:iembre)?)\s+(\d{4})",
-                  texto, re.I
+                  r"(\d{1,2})\s+(ene(?:ro)?|feb(?:rero)?|mar(?:zo)?|abr(?:il)?|may(?:o)?|jun(?:io)?|jul(?:io)?|ago(?:sto)?|sep(?:tiembre)?|sept(?:iembre)?|set(?:iembre)?|oct(?:ubre)?|nov(?:iembre)?|dic(?:iembre)?)\s+(\d{4})",
+                  t,
+                  re.I,
               )
               if m:
-                  mes = MESES.get(m.group(2).lower())
+                  clave = m.group(2).lower()
+                  mes = MESES.get(clave)
+                  if mes is None:
+                      mes = MESES.get(clave[:3])
                   if mes:
                       return datetime(int(m.group(3)), mes, int(m.group(1))).date()
               return None
 
-          def extraer_registros_xml(raw):
-              if not raw:
-                  return {}
-              data = raw
-              for _ in range(5):
-                  nuevo = html.unescape(data)
-                  if nuevo == data:
-                      break
-                  data = nuevo
-              fechas = re.findall(r"<(?:DES_FECHA|DESFECHA)>\s*(.*?)\s*</(?:DES_FECHA|DESFECHA)>", data, re.I | re.S)
-              valores = re.findall(r"<(?:NUM_VALOR|NUMVALOR)>\s*(.*?)\s*</(?:NUM_VALOR|NUMVALOR)>", data, re.I | re.S)
-              registros = {}
-              for f, v in zip(fechas, valores):
-                  try:
-                      fecha = parse_fecha(f)
-                      valor = valor_numero(v)
-                      if fecha and 300 <= valor <= 800:
-                          registros[fecha] = valor
-                  except Exception:
-                      pass
-              return registros
-
-          def pedir(url, data=None, timeout=60):
-              req = Request(
-                  url,
-                  data=data,
-                  method="POST" if data is not None else "GET",
-                  headers={
-                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127 Safari/537.36",
-                      "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*",
-                      "Accept-Language": "es-CR,es;q=0.9,en;q=0.5",
-                      "Content-Type": "application/x-www-form-urlencoded" if data is not None else "text/html",
-                  },
-              )
-              with urlopen(req, timeout=timeout) as r:
-                  return r.read().decode("utf-8", errors="ignore")
-
-          def consultar_ws(indicador):
-              if not token:
-                  print("BCCR_TOKEN no configurado; se omite WS.")
-                  return {}
-
-              params = {
-                  "Indicador": indicador,
-                  "FechaInicio": inicio,
-                  "FechaFinal": final,
-                  "Nombre": nombre,
-                  "SubNiveles": "N",
-                  "CorreoElectronico": correo,
-                  "Token": token,
-              }
-              data = urlencode(params).encode("utf-8")
-
-              for intento, espera in enumerate((0, 5, 15), 1):
-                  if espera:
-                      time.sleep(espera)
-                  try:
-                      raw = pedir(WS_XML, data)
-                      regs = extraer_registros_xml(raw)
-                      if regs:
-                          print(f"WS XML {indicador}: {len(regs)} registros.")
-                          return regs
-                  except HTTPError as e:
-                      print(f"WS XML {indicador}: HTTP {e.code}, intento {intento}")
-                  except Exception as e:
-                      print(f"WS XML {indicador}: {e}")
-
+          def parse_valor(texto):
+              t = texto.strip().replace("\xa0", "").replace("₡", "").replace("CRC", "").replace(" ", "")
+              m = re.search(r"(?<!\d)(\d{3,4}[,.]\d{1,5})(?!\d)", t)
+              if not m:
+                  return None
+              n = m.group(1)
+              if "," in n and "." not in n:
+                  n = n.replace(",", ".")
+              elif "," in n and "." in n:
+                  if n.rfind(",") > n.rfind("."):
+                      n = n.replace(".", "").replace(",", ".")
+                  else:
+                      n = n.replace(",", "")
               try:
-                  raw = pedir(WS_DATASET + "?" + urlencode(params))
-                  regs = extraer_registros_xml(raw)
-                  if regs:
-                      print(f"WS DataSet {indicador}: {len(regs)} registros.")
-                      return regs
-              except Exception as e:
-                  print(f"WS DataSet {indicador}: {e}")
+                  v = round(float(n), 2)
+                  return v if 300 <= v <= 800 else None
+              except Exception:
+                  return None
 
-              return {}
+          def extraer_matriz_tabla(page):
+              tablas = page.locator("table")
+              print("Tablas detectadas:", tablas.count())
 
-          def extraer_serie_sdd(texto, etiqueta):
-              lineas = [re.sub(r"\s+", " ", x).strip() for x in texto.splitlines() if x.strip()]
+              for ti in range(tablas.count()):
+                  tabla = tablas.nth(ti)
+                  filas = tabla.locator("tr")
+                  matriz = []
+                  for fi in range(filas.count()):
+                      celdas = filas.nth(fi).locator("th, td")
+                      fila = []
+                      for ci in range(celdas.count()):
+                          try:
+                              fila.append(re.sub(r"\s+", " ", celdas.nth(ci).inner_text(timeout=3000)).strip())
+                          except Exception:
+                              fila.append("")
+                      if fila:
+                          matriz.append(fila)
+
+                  texto = " ".join(" | ".join(f) for f in matriz).lower()
+                  if "compra" in texto and "venta" in texto:
+                      print(f"Tabla candidata #{ti}:")
+                      for f in matriz:
+                          print("  ", f)
+                      return matriz
+              return None
+
+          def localizar_series(matriz):
+              fila_fechas = None
+              fila_compra = None
+              fila_venta = None
+
+              for fila in matriz:
+                  fechas_en_fila = [parse_fecha(c) for c in fila]
+                  if sum(1 for f in fechas_en_fila if f) >= 1:
+                      fila_fechas = fila
+
+                  if any(re.search(r"\bcompra\b", c, re.I) for c in fila):
+                      fila_compra = fila
+                  if any(re.search(r"\bventa\b", c, re.I) for c in fila):
+                      fila_venta = fila
+
+              if not fila_fechas or not fila_compra or not fila_venta:
+                  return None
+
               registros = {}
-
-              # Caso 1: fecha y valor están en la misma línea.
-              for linea in lineas:
-                  fecha = parse_fecha(linea)
+              max_cols = min(len(fila_fechas), len(fila_compra), len(fila_venta))
+              for i in range(max_cols):
+                  fecha = parse_fecha(fila_fechas[i])
                   if not fecha:
                       continue
-                  nums = re.findall(r"(?<!\d)(\d{3}[,.]\d{2,5})(?!\d)", linea)
-                  for num in nums:
-                      try:
-                          valor = valor_numero(num)
-                          if 300 <= valor <= 800:
-                              registros[fecha] = valor
-                              break
-                      except Exception:
-                          pass
-
-              # Caso 2: tabla con fecha en una línea y valor en líneas cercanas.
-              for i, linea in enumerate(lineas):
-                  fecha = parse_fecha(linea)
-                  if not fecha or fecha in registros:
+                  compra = parse_valor(fila_compra[i])
+                  venta = parse_valor(fila_venta[i])
+                  if compra is None or venta is None:
                       continue
-                  for prox in lineas[i + 1:i + 9]:
-                      nums = re.findall(r"(?<!\d)(\d{3}[,.]\d{2,5})(?!\d)", prox)
-                      encontrado = False
-                      for num in nums:
-                          try:
-                              valor = valor_numero(num)
-                              if 300 <= valor <= 800:
-                                  registros[fecha] = valor
-                                  encontrado = True
-                                  break
-                          except Exception:
-                              pass
-                      if encontrado or parse_fecha(prox):
-                          break
+                  if venta < compra:
+                      continue
+                  registros[fecha] = (compra, venta)
 
-              print(f"SDD {etiqueta}: {len(registros)} registro(s) detectado(s).")
+              return registros or None
+
+          def extraer_por_texto(page):
+              texto = page.locator("body").inner_text(timeout=15000)
+              lineas = [re.sub(r"\s+", " ", x).strip() for x in texto.splitlines() if x.strip()]
+
+              fechas = []
+              for linea in lineas:
+                  f = parse_fecha(linea)
+                  if f:
+                      fechas.append(f)
+
+              fechas = list(dict.fromkeys(fechas))
+
+              compra_vals = []
+              venta_vals = []
+              for i, linea in enumerate(lineas):
+                  if re.fullmatch(r"Compra", linea, re.I):
+                      for x in lineas[i + 1:i + 10]:
+                          if re.fullmatch(r"Venta", x, re.I):
+                              break
+                          v = parse_valor(x)
+                          if v is not None:
+                              compra_vals.append(v)
+                  if re.fullmatch(r"Venta", linea, re.I):
+                      for x in lineas[i + 1:i + 10]:
+                          v = parse_valor(x)
+                          if v is not None:
+                              venta_vals.append(v)
+
+              if not fechas or not compra_vals or not venta_vals:
+                  return None
+
+              n = min(len(fechas), len(compra_vals), len(venta_vals))
+              registros = {}
+              for i in range(n):
+                  c = compra_vals[i]
+                  v = venta_vals[i]
+                  if v >= c:
+                      registros[fechas[i]] = (c, v)
+              return registros or None
+
+          print("=" * 70)
+          print("TIPO DE CAMBIO BCCR - CUADRO OFICIAL UNIFICADO")
+          print("Fecha/hora Costa Rica:", ACTUALIZADO)
+          print("Fecha efectiva buscada:", HOY.strftime("%d/%m/%Y"))
+          print("Fuente:", URL)
+          print("=" * 70)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(locale="es-CR", timezone_id="America/Costa_Rica")
+              page = context.new_page()
+              resp = page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+              print("HTTP:", resp.status if resp else "sin respuesta")
+              try:
+                  page.wait_for_load_state("networkidle", timeout=25000)
+              except Exception:
+                  pass
+              page.wait_for_timeout(5000)
+
+              matriz = extraer_matriz_tabla(page)
+              registros = localizar_series(matriz) if matriz else None
               if not registros:
-                  print(f"SDD {etiqueta}: primeras líneas visibles:")
-                  for x in lineas[:40]:
-                      print("  ", x[:250])
-              return registros
+                  print("No se pudo interpretar la tabla DOM; intentando texto visible.")
+                  registros = extraer_por_texto(page)
 
-          def consultar_sdd_con_navegador():
-              print("Intentando respaldo oficial en la nueva plataforma SDD del BCCR...")
-              with sync_playwright() as p:
-                  browser = p.chromium.launch(headless=True)
-                  context = browser.new_context(locale="es-CR")
-                  page = context.new_page()
+              browser.close()
 
-                  def abrir(url, etiqueta):
-                      print(f"Abriendo SDD {etiqueta}: {url}")
-                      try:
-                          resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                          print(f"SDD {etiqueta}: HTTP", resp.status if resp else "sin respuesta")
-                          try:
-                              page.wait_for_load_state("networkidle", timeout=20000)
-                          except Exception:
-                              pass
-                          page.wait_for_timeout(5000)
-                          texto = page.locator("body").inner_text(timeout=15000)
-                          print(f"SDD {etiqueta}: {len(texto)} caracteres visibles.")
-                          return extraer_serie_sdd(texto, etiqueta)
-                      except Exception as e:
-                          print(f"SDD {etiqueta}: error al abrir/leer: {e}")
-                          return {}
+          if not registros:
+              print("ERROR: no fue posible extraer compra y venta del Cuadro=1.")
+              sys.exit(1)
 
-                  compras = abrir(SDD_COMPRA, "compra")
-                  ventas = abrir(SDD_VENTA, "venta")
-                  browser.close()
+          print("Registros encontrados:")
+          for f in sorted(registros):
+              print(f"  {f.strftime('%d/%m/%Y')}: compra={registros[f][0]} venta={registros[f][1]}")
 
-              comunes = sorted(set(compras) & set(ventas), reverse=True)
-              if not comunes:
-                  print("SDD: no se encontraron fechas comunes entre compra y venta.")
-                  return None
-
-              fecha = comunes[0]
-              compra = compras[fecha]
-              venta = ventas[fecha]
-              if not (300 <= compra <= 800 and 300 <= venta <= 800 and venta >= compra):
-                  print(f"SDD: valores inválidos: {fecha=} {compra=} {venta=}")
-                  return None
-
-              print(f"SDD OK: {fecha.strftime('%d/%m/%Y')} compra={compra} venta={venta}")
-              return fecha, compra, venta
-
-          print("=" * 70)
-          print("ACTUALIZACIÓN DEL TIPO DE CAMBIO BCCR")
-          print("Fecha/hora Costa Rica:", actualizado)
-          print("Periodo:", inicio, "a", final)
-          print("=" * 70)
-
-          compras = consultar_ws("317")
-          ventas = consultar_ws("318")
-          comunes = sorted(set(compras) & set(ventas), reverse=True)
-
-          if comunes:
-              fecha = comunes[0]
-              compra = compras[fecha]
-              venta = ventas[fecha]
-              fuente = "Web Service del Banco Central de Costa Rica"
+          # Regla clave: usar la fecha efectiva de Costa Rica. El BCCR puede publicar
+          # anticipadamente el tipo de cambio del día siguiente, pero no debe mostrarse
+          # hasta que esa fecha llegue.
+          if HOY in registros:
+              fecha = HOY
           else:
-              respaldo = consultar_sdd_con_navegador()
-              if not respaldo:
-                  print("ERROR: no fue posible obtener datos válidos desde las fuentes oficiales del BCCR.")
+              anteriores = [f for f in registros if f <= HOY]
+              if not anteriores:
+                  print("ERROR: el cuadro no contiene un dato vigente para hoy ni una fecha anterior.")
                   sys.exit(1)
-              fecha, compra, venta = respaldo
-              fuente = "Plataforma SDD de Indicadores Económicos del Banco Central de Costa Rica"
+              fecha = max(anteriores)
+
+          compra, venta = registros[fecha]
 
           salida = {
               "compra": compra,
               "venta": venta,
               "fecha": fecha.strftime("%d/%m/%Y"),
-              "actualizado": actualizado,
-              "fuente": fuente,
+              "actualizado": ACTUALIZADO,
+              "fuente": "Cuadro 1 de la Plataforma SDD de Indicadores Económicos del Banco Central de Costa Rica",
           }
 
           with open("tipocambio.json", "w", encoding="utf-8", newline="\n") as f:
@@ -333,6 +289,6 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Actualiza tipo de cambio del BCCR"
+          git commit -m "Actualiza tipo de cambio del Cuadro 1 del BCCR"
           git pull --rebase origin main
           git push origin main
